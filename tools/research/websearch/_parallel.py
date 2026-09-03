@@ -132,10 +132,6 @@ class ParallelBackend:
         self._rest_auth_failed = False
 
     @property
-    def has_api_key(self) -> bool:
-        return bool(self._api_key)
-
-    @property
     def search_mode(self) -> str:
         return "api" if self._api_key and not self._rest_auth_failed else "mcp"
 
@@ -401,9 +397,10 @@ class ParallelBackend:
     ) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             mcp_session_id = await self._mcp_initialize(client)
+            request_id = str(uuid.uuid4())
             envelope = {
                 "jsonrpc": "2.0",
-                "id": str(uuid.uuid4()),
+                "id": request_id,
                 "method": "tools/call",
                 "params": {"name": tool_name, "arguments": arguments},
             }
@@ -413,7 +410,7 @@ class ParallelBackend:
                 json=envelope,
             )
             response.raise_for_status()
-            envelope_out = decode_jsonrpc_response(response)
+            envelope_out = decode_jsonrpc_response(response, request_id)
         if "error" in envelope_out:
             raise RuntimeError(f"Parallel MCP error: {str(envelope_out['error'])[:500]}")
         result = envelope_out.get("result") or {}
@@ -444,9 +441,10 @@ class ParallelBackend:
         raise RuntimeError(f"Parallel MCP returned no parseable content: {str(result)[:500]}")
 
     async def _mcp_initialize(self, client: httpx.AsyncClient) -> str:
+        init_request_id = str(uuid.uuid4())
         init_envelope = {
             "jsonrpc": "2.0",
-            "id": str(uuid.uuid4()),
+            "id": init_request_id,
             "method": "initialize",
             "params": {
                 "protocolVersion": MCP_PROTOCOL_VERSION,
@@ -461,7 +459,7 @@ class ParallelBackend:
         )
         init_response.raise_for_status()
         mcp_session_id = init_response.headers.get("mcp-session-id")
-        _ = decode_jsonrpc_response(init_response)
+        _ = decode_jsonrpc_response(init_response, init_request_id)
         notify = {"jsonrpc": "2.0", "method": "notifications/initialized"}
         ack = await client.post(
             self._mcp_url,

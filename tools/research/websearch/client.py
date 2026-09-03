@@ -18,7 +18,7 @@ import re
 import time
 import warnings
 from collections.abc import Callable
-from typing import Any, Protocol
+from typing import Any, Protocol, get_args
 
 from anthropic import AsyncAnthropic, AuthenticationError
 
@@ -33,8 +33,10 @@ from .models import (
     DeepResearchResponse,
     DeepResearchResult,
     DeepResearchSpec,
+    ResearchEffort,
     ResponseMeta,
     RetrievalResult,
+    SearchEffort,
     SearchRequestSpec,
     SearchResponse,
     SourceDocument,
@@ -49,19 +51,18 @@ WRITE_TOTAL_CHAR_BUDGET = 220000
 WEBSEARCH_BACKEND_ENV = "WEBSEARCH_BACKEND"
 BACKEND_NAMES = ("tako", "parallel")
 DEFAULT_BACKEND = "tako"
-SEARCH_EFFORTS = ("instant", "fast", "deep")
-RESEARCH_EFFORTS = ("medium", "high")
+SEARCH_EFFORTS = get_args(SearchEffort)
+RESEARCH_EFFORTS = get_args(ResearchEffort)
 MODE_TO_EFFORT = {"basic": "instant", "advanced": "fast"}
 
 
 class ResearchBackend(Protocol):
-    """One vendor's retrieval and research. Synthesis and assembly stay in the client."""
+    """One vendor's retrieval and research. Synthesis and assembly stay in the client.
 
-    @property
-    def search_mode(self) -> str: ...
-
-    @property
-    def has_api_key(self) -> bool: ...
+    Each call reports which path it took as `RetrievalResult.backend`
+    (`tako:api`, `tako:anonymous`, `parallel:api`, `parallel:mcp`); a backend
+    keeps its own keyed-vs-anonymous state private.
+    """
 
     async def search(self, request: SearchRequestSpec) -> RetrievalResult: ...
 
@@ -71,8 +72,8 @@ class ResearchBackend(Protocol):
 
 
 def _resolve_backend_name(override: str | None) -> str:
-    raw = override or os.getenv(WEBSEARCH_BACKEND_ENV, DEFAULT_BACKEND)  # noqa: TID251  # deployment config, not a secret
-    name = raw.strip().lower()
+    raw = override or os.getenv(WEBSEARCH_BACKEND_ENV, "")  # noqa: TID251  # deployment config, not a secret
+    name = raw.strip().lower() or DEFAULT_BACKEND
     if name not in BACKEND_NAMES:
         raise RuntimeError(
             f"{WEBSEARCH_BACKEND_ENV}={name!r} is not supported. "
@@ -83,10 +84,10 @@ def _resolve_backend_name(override: str | None) -> str:
 
 def _resolve_search_effort(effort: str | None, mode: str | None) -> str | None:
     if effort is not None and mode is not None:
-        raise ValueError("Pass either effort or mode, not both. mode is deprecated.")
+        raise ValueError("Pass either --effort or --mode, not both. --mode is deprecated.")
     if mode is not None:
         if mode not in MODE_TO_EFFORT:
-            raise ValueError(f"mode must be 'basic' or 'advanced' (got {mode!r}).")
+            raise ValueError(f"--mode must be 'basic' or 'advanced' (got {mode!r}).")
         warnings.warn(
             "mode is deprecated; use effort ('basic' -> 'instant', 'advanced' -> 'fast').",
             DeprecationWarning,
@@ -125,29 +126,39 @@ def _is_configured(key: str) -> bool:
         return bool(val) and val != key
 
 
+def _placeholder(key: str) -> str:
+    """Resolve a secret to its value, or to the key name iron-proxy swaps in flight.
+
+    An exported-but-empty variable resolves to `""` through `secret()`, which
+    would skip the keyed attempt entirely rather than let the 401 fallback
+    decide. Kubernetes produces that shape for an optional secret left unset.
+    """
+    return secret(key, key) or key
+
+
 class WebSearchClient:
     """Web search and deep research over one configurable backend."""
 
     def __init__(
         self,
+        *,
+        backend: str | None = None,
         parallel_api_key: str | None = None,
         parallel_api_base_url: str | None = None,
         parallel_mcp_url: str | None = None,
         parallel_deep_research_processor: str | None = None,
-        anthropic_api_key: str | None = None,
-        synthesis_model: str | None = None,
-        max_retries: int = 3,
-        *,
-        backend: str | None = None,
         tako_api_key: str | None = None,
         tako_api_base_url: str | None = None,
         tako_mcp_url: str | None = None,
+        anthropic_api_key: str | None = None,
+        synthesis_model: str | None = None,
+        max_retries: int = 3,
     ) -> None:
         self._backend_name = _resolve_backend_name(backend)
         # Always pass the StubBackend placeholder so the SDK sends x-api-key.
         # Search falls back to anonymous MCP if injected authentication fails.
-        self._parallel_api_key = parallel_api_key or secret("PARALLEL_API_KEY", "PARALLEL_API_KEY")
-        self._tako_api_key = tako_api_key or secret("TAKO_API_KEY", "TAKO_API_KEY")
+        self._parallel_api_key = parallel_api_key or _placeholder("PARALLEL_API_KEY")
+        self._tako_api_key = tako_api_key or _placeholder("TAKO_API_KEY")
         self._has_anthropic_key = anthropic_api_key is not None or _is_configured(
             "ANTHROPIC_API_KEY"
         )
@@ -192,14 +203,6 @@ class WebSearchClient:
     @property
     def backend_name(self) -> str:
         return self._backend_name
-
-    @property
-    def search_mode(self) -> str:
-        return self._backend.search_mode
-
-    @property
-    def has_api_key(self) -> bool:
-        return self._backend.has_api_key
 
     @property
     def has_synthesis(self) -> bool:
@@ -285,6 +288,10 @@ class WebSearchClient:
                 thread_context=thread_context,
                 max_report_chars=max(1, max_report_chars - len(footer)),
                 partial_failures=partial_failures,
+            )
+        if synthesize and not capped:
+            partial_failures.append(
+                {"query": query, "error": "synthesis skipped: retrieval returned no sources."}
             )
         if footer and answer_markdown:
             answer_markdown = f"{answer_markdown.rstrip()}{footer}"

@@ -16,7 +16,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
-from httpx_sse import aconnect_sse
+from httpx_sse import SSEError, aconnect_sse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ._common import (
@@ -48,9 +48,11 @@ STREAM_READ_TIMEOUT_SECONDS = 120.0
 POLL_INTERVAL_SECONDS = 5.0
 SNIPPET_CHAR_LIMIT = 7000
 MAX_SOURCE_COUNT = 20
+DATA_CARD_COUNT = 2
 MAX_DOMAIN_FILTERS = 20
 FALLBACK_CITATION_URL = "https://tako.com"
 RATE_LIMIT_KINDS = {"rate_limited", "global_rate_limited"}
+NOT_GRANTED_STATUSES = {401, 403}
 TERMINAL_RUN_STATUSES = {"completed", "failed"}
 
 
@@ -245,6 +247,8 @@ class StreamEnvelope(BaseModel):
 
 
 class _StreamState(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     run_id: str | None = None
     last_seq: int = -1
     status: str | None = None
@@ -252,10 +256,17 @@ class _StreamState(BaseModel):
     usage: Usage | None = None
     error: RunError | None = None
     done: bool = False
+    transport_error: Exception | None = None
 
 
 class NotGranted(Exception):
     """The placeholder was not rewritten: this principal has no TAKO_API_KEY grant."""
+
+
+def _skip_unreadable(progress: Callable[[str], None], what: str, exc: ValidationError) -> None:
+    """Report a frame the tool cannot parse. The poll fallback still returns the run."""
+    count = exc.error_count()
+    progress(f"skipped an unreadable {what} ({count} field{'' if count == 1 else 's'})")
 
 
 def _as_run_error(value: RunError | str | None) -> RunError | None:
@@ -383,7 +394,11 @@ def normalize_answer_result(
         card.title: card.webpage_url for card in result.cards if card.title and card.webpage_url
     }
     sources: list[SourceDocument] = []
+    seen_indexes: set[int] = set()
     for citation in result.citations:
+        if citation.index in seen_indexes:
+            continue
+        seen_indexes.add(citation.index)
         url = citation.url or card_url_by_title.get(citation.title) or FALLBACK_CITATION_URL
         sources.append(
             SourceDocument(
@@ -455,10 +470,6 @@ class TakoBackend:
         self._rest_auth_failed = False
 
     @property
-    def has_api_key(self) -> bool:
-        return bool(self._api_key)
-
-    @property
     def search_mode(self) -> str:
         return "api" if self._api_key and not self._rest_auth_failed else "anonymous"
 
@@ -491,19 +502,21 @@ class TakoBackend:
                 return await self._search_api(request, query)
             except NotGranted:
                 self._rest_auth_failed = True
-                partial_failures.append(
-                    {
-                        "query": query,
-                        "error": (
-                            "TAKO_API_KEY did not authenticate; fell back to anonymous Tako "
-                            "search. Configure a granted key to use the REST API."
-                        ),
-                    }
-                )
+        if self._api_key and self._rest_auth_failed:
+            partial_failures.append(
+                {
+                    "query": query,
+                    "error": (
+                        "TAKO_API_KEY did not authenticate; fell back to anonymous Tako "
+                        "search. Configure a granted key to use the REST API."
+                    ),
+                }
+            )
         return await self._search_anonymous(request, query, partial_failures)
 
     def _search_body(self, request: SearchRequestSpec, query: str) -> dict[str, Any]:
         count = max(1, min(MAX_SOURCE_COUNT, request.num_results))
+        data_count = min(count, DATA_CARD_COUNT)
         web: dict[str, Any] = {"count": count, "highlights": True}
         if request.include_domains:
             web["include_domains"] = request.include_domains[:MAX_DOMAIN_FILTERS]
@@ -512,7 +525,10 @@ class TakoBackend:
         if request.max_age_hours is not None and request.max_age_hours > 0:
             cutoff = dt.datetime.now(dt.UTC) - dt.timedelta(hours=request.max_age_hours)
             web["published_after"] = cutoff.date().isoformat()
-        body: dict[str, Any] = {"query": query, "sources": {"data": {"count": count}, "web": web}}
+        body: dict[str, Any] = {
+            "query": query,
+            "sources": {"data": {"count": data_count}, "web": web},
+        }
         if request.effort:
             body["effort"] = request.effort
         return body
@@ -524,7 +540,7 @@ class TakoBackend:
                 headers=self._keyed_headers(),
                 json=self._search_body(request, query),
             )
-        if response.status_code == 401:
+        if response.status_code in NOT_GRANTED_STATUSES:
             raise NotGranted
         response.raise_for_status()
         payload = SearchApiResponse.model_validate(response.json())
@@ -534,6 +550,21 @@ class TakoBackend:
                 {
                     "query": query,
                     "error": "max_chars_total is not supported by Tako search (its cap is per result); ignored.",
+                }
+            )
+        parallel_only = [
+            name
+            for name, value in (
+                ("client_model", request.client_model),
+                ("session_id", request.session_id),
+            )
+            if value is not None
+        ]
+        if parallel_only:
+            partial_failures.append(
+                {
+                    "query": query,
+                    "error": f"{', '.join(parallel_only)} is a Parallel REST knob; Tako search ignores it.",
                 }
             )
         billed = payload.usage.total_cost_usd if payload.usage else None
@@ -557,6 +588,10 @@ class TakoBackend:
             ignored.append(f"effort={request.effort!r}")
         if request.max_chars_total is not None:
             ignored.append("max_chars_total")
+        if request.client_model is not None:
+            ignored.append("client_model")
+        if request.session_id is not None:
+            ignored.append("session_id")
         if request.num_results != 10:
             ignored.append(
                 f"num_results={request.num_results} (anonymous search serves a fixed count; client-side cap only)"
@@ -571,9 +606,10 @@ class TakoBackend:
                     ),
                 }
             )
+        request_id = str(uuid.uuid4())
         envelope = {
             "jsonrpc": "2.0",
-            "id": str(uuid.uuid4()),
+            "id": request_id,
             "method": "tools/call",
             "params": {
                 "name": "tako_search",
@@ -585,11 +621,11 @@ class TakoBackend:
                 self._mcp_url, headers=self._anonymous_headers(), json=envelope
             )
         if response.status_code == 429:
-            reply = JsonRpcResponse.model_validate(decode_jsonrpc_response(response))
+            reply = JsonRpcResponse.model_validate(decode_jsonrpc_response(response, request_id))
             detail = reply.error.message if reply.error else response.text[:200]
             raise RuntimeError(f"Anonymous Tako search is rate limited: {detail}")
         response.raise_for_status()
-        reply = JsonRpcResponse.model_validate(decode_jsonrpc_response(response))
+        reply = JsonRpcResponse.model_validate(decode_jsonrpc_response(response, request_id))
         if reply.error is not None:
             raise RuntimeError(f"Tako MCP error: {reply.error.message[:500]}")
         result = reply.result
@@ -621,7 +657,11 @@ class TakoBackend:
         if not question:
             raise RuntimeError("question cannot be empty.")
         effort = request.effort or DEFAULT_RESEARCH_EFFORT
-        timeout_seconds = request.timeout_seconds or DEFAULT_DEEP_RESEARCH_TIMEOUT_SECONDS
+        timeout_seconds = (
+            DEFAULT_DEEP_RESEARCH_TIMEOUT_SECONDS
+            if request.timeout_seconds is None
+            else request.timeout_seconds
+        )
         partial_failures: list[dict[str, str]] = []
         if request.processor:
             partial_failures.append(
@@ -700,7 +740,9 @@ class TakoBackend:
             if state.status == "failed" and state.run_id:
                 return AnswerAgentRun(run_id=state.run_id, status="failed", error=state.error)
             if not state.run_id:
-                raise RuntimeError("Tako answer agent stream ended before a run_id arrived.")
+                raise RuntimeError(
+                    "Tako answer agent stream ended before a run_id arrived."
+                ) from state.transport_error
             return await self._poll_run(client, state.run_id, progress)
 
     async def _consume_stream(
@@ -733,17 +775,21 @@ class TakoBackend:
                     try:
                         envelope = StreamEnvelope.model_validate_json(sse.data)
                     except ValidationError as exc:
-                        # A frame this tool cannot read must not end the run: the
-                        # poll fallback still returns the terminal result.
-                        progress(f"skipped an unreadable stream frame ({exc.error_count()} field)")
+                        _skip_unreadable(progress, "stream frame", exc)
                         continue
                     state.run_id = envelope.run_id
                     state.last_seq = envelope.seq
                     self._apply_block(envelope.block, state, progress)
                     if state.done:
                         return
-        except (httpx.NetworkError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
+        except (
+            httpx.NetworkError,
+            httpx.TimeoutException,
+            httpx.RemoteProtocolError,
+            SSEError,
+        ) as exc:
             progress(f"stream interrupted: {exc}")
+            state.transport_error = exc
 
     @staticmethod
     def _apply_block(
@@ -760,7 +806,10 @@ class TakoBackend:
         elif block.kind == "subagent" and block.subagent_type:
             progress(f"{block.event or 'subagent'} {block.subagent_type}")
         elif block.kind == "agent_result" and block.data is not None:
-            state.result = AnswerAgentResult.model_validate(block.data)
+            try:
+                state.result = AnswerAgentResult.model_validate(block.data)
+            except ValidationError as exc:
+                _skip_unreadable(progress, "agent_result", exc)
         elif block.kind == "run_summary":
             state.status = block.status
             state.usage = block.usage

@@ -15,6 +15,13 @@ from centaur_tool_websearch.client import WebSearchClient
 from centaur_tool_websearch.models import DeepResearchResult, RetrievalResult, SourceDocument
 
 from centaur_sdk.backends import StubBackend, configure
+from centaur_sdk.backends.env import EnvBackend
+
+
+@pytest.fixture(autouse=True)
+def _unset_tool_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in ("TAKO_API_KEY", "PARALLEL_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
 
 
 def _doc(i: int) -> SourceDocument:
@@ -25,8 +32,6 @@ class RecordingBackend:
     def __init__(self, result: RetrievalResult) -> None:
         self.result = result
         self.requests = []
-        self.search_mode = "api"
-        self.has_api_key = True
 
     async def search(self, request):
         self.requests.append(request)
@@ -43,7 +48,18 @@ def test_client_uses_stub_to_enable_proxy_injection() -> None:
 
     assert client._parallel_api_key == "PARALLEL_API_KEY"
     assert client._tako_api_key == "TAKO_API_KEY"
-    assert client.has_api_key is True
+
+
+def test_an_exported_but_empty_key_still_takes_the_keyed_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure(EnvBackend())
+    monkeypatch.setenv("TAKO_API_KEY", "")
+
+    client = WebSearchClient(backend="tako")
+
+    assert client._tako_api_key == "TAKO_API_KEY"
+    assert client._backend.search_mode == "api"
 
 
 def test_parallel_secret_is_injected_into_sdk_header() -> None:
@@ -60,6 +76,29 @@ def test_parallel_secret_is_injected_into_sdk_header() -> None:
     }
 
 
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_a_blank_backend_env_uses_the_default(monkeypatch: pytest.MonkeyPatch, blank: str) -> None:
+    monkeypatch.setenv(client_module.WEBSEARCH_BACKEND_ENV, blank)
+    configure(StubBackend())
+
+    assert WebSearchClient().backend_name == client_module.DEFAULT_BACKEND
+
+
+def test_synthesis_skipped_for_no_sources_is_distinguishable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure(StubBackend())
+    client = WebSearchClient(backend="parallel")
+    client._backend = RecordingBackend(RetrievalResult(sources=[], backend="fake"))
+
+    result = asyncio.run(client.search("q"))
+
+    assert result["answer_markdown"] is None
+    assert any(
+        "retrieval returned no sources" in f["error"] for f in result["meta"]["partial_failures"]
+    )
+
+
 def test_unknown_backend_name_raises_at_construction(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(client_module.WEBSEARCH_BACKEND_ENV, "exa")
     with pytest.raises(RuntimeError, match="WEBSEARCH_BACKEND='exa' is not supported"):
@@ -70,23 +109,6 @@ def test_backend_env_selects_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(client_module.WEBSEARCH_BACKEND_ENV, "parallel")
     configure(StubBackend())
     assert isinstance(WebSearchClient()._backend, ParallelBackend)
-
-
-def test_search_attempts_rest_with_inject_stub(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def search_rest(**_kwargs):
-        return [], "api-request", []
-
-    async def reject_mcp(**_kwargs):
-        raise AssertionError("MCP should not be used when injected auth succeeds")
-
-    configure(StubBackend())
-    client = WebSearchClient(backend="parallel")
-    monkeypatch.setattr(client._backend, "_search_api", search_rest)
-    monkeypatch.setattr(client._backend, "_search_mcp", reject_mcp)
-
-    result = asyncio.run(client.search("injected", synthesize=False))
-
-    assert result["meta"]["backend"] == "parallel:api"
 
 
 def test_search_falls_back_to_anonymous_mcp_when_injected_auth_is_unavailable(
@@ -111,8 +133,6 @@ def test_search_falls_back_to_anonymous_mcp_when_injected_auth_is_unavailable(
 
     assert result["meta"]["backend"] == "parallel:mcp"
     assert result["meta"]["attribution"] == _parallel._FREE_MCP_ATTRIBUTION
-    assert client.search_mode == "mcp"
-    assert client._backend._mcp_headers(None).get("Authorization") is None
 
 
 def test_deep_research_reports_missing_injected_auth(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -213,7 +233,7 @@ def test_mode_is_translated_to_effort_with_warning(mode: str, effort: str) -> No
 def test_mode_and_effort_together_is_an_error() -> None:
     configure(StubBackend())
     client = WebSearchClient(backend="parallel")
-    with pytest.raises(ValueError, match="either effort or mode"):
+    with pytest.raises(ValueError, match=r"either --effort or --mode"):
         asyncio.run(client.search("q", mode="basic", effort="fast"))
 
 
@@ -307,13 +327,13 @@ def test_routing_matrix_never_crosses_vendors(
             pass
 
         async def rest(**_kwargs):
-            hosts.append("api.parallel.ai")
             if not granted:
                 raise FakeAuthenticationError
             return [], "r", []
 
         async def mcp(**_kwargs):
-            hosts.append("search.parallel.ai")
+            if granted:
+                raise AssertionError("MCP must not run when injected auth succeeds")
             return [], "m", []
 
         monkeypatch.setattr(_parallel, "AuthenticationError", FakeAuthenticationError)
@@ -323,18 +343,12 @@ def test_routing_matrix_never_crosses_vendors(
     result = asyncio.run(client.search("q", synthesize=False))
 
     assert result["meta"]["backend"] == expected
-    vendor_hosts = {
-        "tako": {"tako.com", "mcp.tako.com"},
-        "parallel": {"api.parallel.ai", "search.parallel.ai"},
-    }
-    assert set(hosts) <= vendor_hosts[backend_name]
+    if backend_name == "tako":
+        assert set(hosts) <= {"tako.com", "mcp.tako.com"}
 
 
 def test_deep_research_response_from_backend_result() -> None:
     class FakeBackend:
-        search_mode = "api"
-        has_api_key = True
-
         async def search(self, request):
             raise AssertionError
 

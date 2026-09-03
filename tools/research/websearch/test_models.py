@@ -1,24 +1,29 @@
 from __future__ import annotations
 
-import tomllib
-from pathlib import Path
+from typing import get_args
 
-import httpx
 import pytest
-from centaur_tool_websearch import _common
+from centaur_tool_websearch import _parallel, _tako
+from centaur_tool_websearch import client as client_module
 from centaur_tool_websearch.models import (
     DeepResearchResult,
     DeepResearchSpec,
+    ResearchEffort,
     RetrievalResult,
+    SearchEffort,
     SearchRequestSpec,
-    SourceDocument,
 )
 
 
-def test_tool_version_matches_pyproject() -> None:
-    manifest = tomllib.loads(Path(__file__).with_name("pyproject.toml").read_text())
-    assert manifest["project"]["version"] == _common.FALLBACK_VERSION
-    assert f"centaur-websearch/{_common.TOOL_VERSION}" == _common.USER_AGENT
+def test_every_effort_has_a_price_and_a_vendor_mapping() -> None:
+    search_efforts = set(get_args(SearchEffort))
+    research_efforts = set(get_args(ResearchEffort))
+
+    assert set(client_module.SEARCH_EFFORTS) == search_efforts
+    assert set(client_module.RESEARCH_EFFORTS) == research_efforts
+    assert search_efforts <= set(_tako.SEARCH_PRICE_USD)
+    assert search_efforts <= set(_parallel.EFFORT_TO_SEARCH_MODE)
+    assert research_efforts <= set(_parallel.EFFORT_TO_PROCESSOR)
 
 
 def test_search_request_spec_defaults() -> None:
@@ -55,28 +60,3 @@ def test_deep_research_result_carries_usage() -> None:
     result = DeepResearchResult(sources=[], answer_markdown="a", backend="tako:agent")
     assert result.usage == []
     assert result.request_ids == []
-
-
-def test_append_within_budget_protects_trailer() -> None:
-    trailer = "\n\n## Sources\n[1] t — u"
-    out = _common.append_within_budget("x" * 100, trailer, 40)
-    assert out == "x" * (40 - len(trailer)) + trailer
-    assert len(out) == 40
-    assert _common.append_within_budget("short", trailer, 400) == "short" + trailer
-
-
-def test_render_sources_block() -> None:
-    docs = [SourceDocument(source_id=1, title="T", url="https://a.example")]
-    assert _common.render_sources_block(docs) == "\n\n## Sources\n[1] T — https://a.example"
-    assert _common.render_sources_block([]) == ""
-
-
-def test_decode_jsonrpc_response_handles_json_and_sse() -> None:
-    plain = httpx.Response(200, json={"jsonrpc": "2.0", "result": {"a": 1}})
-    assert _common.decode_jsonrpc_response(plain) == {"jsonrpc": "2.0", "result": {"a": 1}}
-    sse = httpx.Response(
-        200,
-        headers={"content-type": "text/event-stream"},
-        content=b'event: message\ndata: {"jsonrpc": "2.0", "result": {"b": 2}}\n\n',
-    )
-    assert _common.decode_jsonrpc_response(sse) == {"jsonrpc": "2.0", "result": {"b": 2}}

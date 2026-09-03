@@ -32,12 +32,13 @@ build-backend = "hatchling.build"
 module = "client.py"
 # WEBSEARCH_BACKEND (sandbox env, default `tako`) picks the vendor. Within a
 # vendor, `search` tries the keyed REST path with the injected placeholder and
-# falls back to that vendor's anonymous path on 401. `deep-research` needs the
-# vendor's key: TAKO_API_KEY for the Tako Answer Agent, PARALLEL_API_KEY for
+# falls back to that vendor's anonymous path on 401 or 403. `deep-research`
+# needs the vendor's key: TAKO_API_KEY for the Tako Answer Agent, PARALLEL_API_KEY for
 # the Parallel Task API. ANTHROPIC_API_KEY enables the Claude synthesis
 # pipeline on top of `search` results (reviewer → writer → citation repair).
-# No secret binds to mcp.tako.com or search.parallel.ai: those paths stay
-# anonymous.
+# Give every secret below its own `hosts`. An entry that omits them inherits the
+# top-level `hosts` list, which would bind it to mcp.tako.com and
+# search.parallel.ai — the paths that must stay anonymous.
 optional_secrets = [
     {type = "http", name = "TAKO_API_KEY", mode = "inject", inject_header = "X-API-Key", hosts = ["tako.com"]},
     {type = "http", name = "PARALLEL_API_KEY", mode = "inject", inject_header = "x-api-key", hosts = ["api.parallel.ai"]},

@@ -47,16 +47,26 @@ def render_sources_block(sources: list[SourceDocument]) -> str:
     return "\n\n## Sources\n" + "\n".join(lines)
 
 
-def decode_jsonrpc_response(response: httpx.Response) -> dict[str, Any]:
+def decode_jsonrpc_response(
+    response: httpx.Response, request_id: str | None = None
+) -> dict[str, Any]:
     """Decode a JSON-RPC reply that arrived as JSON or as an SSE body.
 
-    For SSE, the last event whose `data:` lines parse as a JSON object wins.
+    For SSE, the reply is the event whose `id` matches `request_id`; a server
+    that interleaves notifications sends them on the same stream. When no frame
+    carries the id, the last event that parses as a JSON object wins.
     """
     content_type = response.headers.get("content-type", "")
     text = response.text
     if "text/event-stream" not in content_type:
-        return json.loads(text) if text.strip() else {}
+        if not text.strip():
+            return {}
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return {}
     latest: dict[str, Any] | None = None
+    matched: dict[str, Any] | None = None
     for event_block in text.split("\n\n"):
         data_lines = [
             line[len("data:") :].lstrip(" ")
@@ -72,6 +82,9 @@ def decode_jsonrpc_response(response: httpx.Response) -> dict[str, Any]:
             continue
         if isinstance(parsed, dict):
             latest = parsed
-    if latest is None:
+            if request_id is not None and parsed.get("id") == request_id:
+                matched = parsed
+    reply = matched if matched is not None else latest
+    if reply is None:
         raise RuntimeError("JSON-RPC endpoint returned an empty SSE stream.")
-    return latest
+    return reply

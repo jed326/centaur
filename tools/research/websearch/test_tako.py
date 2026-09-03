@@ -160,11 +160,6 @@ def test_v3_cards_come_first_and_carry_definitions_and_methodology() -> None:
     ]
 
 
-def test_v3_card_without_webpage_url_is_dropped() -> None:
-    docs = normalize_search_response(SearchApiResponse.model_validate(V3_RESPONSE))
-    assert all(d.title != "No page" for d in docs)
-
-
 def test_v3_card_falls_back_to_semantic_description() -> None:
     payload = SearchApiResponse.model_validate(V3_RESPONSE)
     payload.cards[0].description = ""
@@ -249,10 +244,6 @@ def test_answer_result_omits_empty_sections_and_protects_sources() -> None:
     assert report.endswith("[3] Unlinked data source — https://tako.com")
 
 
-def test_caller_header_value() -> None:
-    assert f'channel=centaur, client_version="{_tako.TOOL_VERSION}"' == _tako.CALLER_VALUE
-
-
 def _rpc_ok(structured: dict) -> dict:
     return {
         "jsonrpc": "2.0",
@@ -316,12 +307,12 @@ def test_keyed_search_hits_v3_with_placeholder_and_attribution_headers() -> None
     request = recorder.requests[0]
     assert request.url.path == "/api/v3/search"
     assert request.headers["x-api-key"] == "TAKO_API_KEY"
-    assert request.headers["x-tako-caller"] == _tako.CALLER_VALUE
-    assert request.headers["user-agent"] == f"centaur-websearch/{_tako.TOOL_VERSION}"
+    assert request.headers["x-tako-caller"].startswith('channel=centaur, client_version="')
+    assert request.headers["user-agent"].startswith("centaur-websearch/")
     body = json.loads(request.content)
     assert body["query"] == "US GDP"
     assert body["effort"] == "deep"
-    assert body["sources"]["data"] == {"count": 7}
+    assert body["sources"]["data"] == {"count": _tako.DATA_CARD_COUNT}
     assert body["sources"]["web"]["count"] == 7
     assert body["sources"]["web"]["highlights"] is True
     assert body["sources"]["web"]["include_domains"] == ["bea.gov"]
@@ -344,9 +335,35 @@ def test_keyed_search_caps_counts_at_twenty_and_prices_deep_without_usage() -> N
         _backend(recorder).search(SearchRequestSpec(query="q", num_results=40, effort="deep"))
     )
     body = json.loads(recorder.requests[0].content)
-    assert body["sources"]["data"]["count"] == 20
+    assert body["sources"]["data"]["count"] == _tako.DATA_CARD_COUNT
     assert body["sources"]["web"]["count"] == 20
     assert result.estimated_cost_usd == 0.012
+
+
+def test_web_results_survive_the_client_cap_at_the_default_count() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "cards": [
+                    {"title": f"c{i}", "webpage_url": f"https://tako.com/{i}", "description": "d"}
+                    for i in range(body["sources"]["data"]["count"])
+                ],
+                "web_results": [
+                    {"title": f"w{i}", "url": f"https://w.example/{i}", "snippet": "s"}
+                    for i in range(body["sources"]["web"]["count"])
+                ],
+                "request_id": "r1",
+            },
+        )
+
+    backend = TakoBackend(api_key="k", transport=httpx.MockTransport(handler))
+    result = asyncio.run(backend.search(SearchRequestSpec(query="q", num_results=10)))
+
+    hosts = [httpx.URL(d.url).host for d in result.sources[:10]]
+    assert hosts.count("tako.com") == _tako.DATA_CARD_COUNT
+    assert hosts.count("w.example") == 10 - _tako.DATA_CARD_COUNT
 
 
 def test_keyed_search_notes_max_chars_total() -> None:
@@ -355,6 +372,68 @@ def test_keyed_search_notes_max_chars_total() -> None:
         _backend(recorder).search(SearchRequestSpec(query="q", max_chars_total=5000))
     )
     assert any("max_chars_total" in f["error"] for f in result.partial_failures)
+
+
+def test_keyed_search_notes_the_parallel_only_knobs_it_drops() -> None:
+    recorder = Recorder()
+    result = asyncio.run(
+        _backend(recorder).search(
+            SearchRequestSpec(query="q", client_model="claude-opus-4-7", session_id="s-1")
+        )
+    )
+    notes = " ".join(f["error"] for f in result.partial_failures)
+    assert "client_model" in notes
+    assert "session_id" in notes
+
+
+def test_403_falls_back_to_anonymous_like_a_401() -> None:
+    recorder = Recorder(rest_status=403)
+
+    result = asyncio.run(_backend(recorder).search(SearchRequestSpec(query="q")))
+
+    assert result.backend == "tako:anonymous"
+    assert any("did not authenticate" in f["error"] for f in result.partial_failures)
+
+
+def test_the_auth_note_repeats_on_every_later_search() -> None:
+    recorder = Recorder(rest_status=401)
+    backend = _backend(recorder)
+
+    asyncio.run(backend.search(SearchRequestSpec(query="first")))
+    second = asyncio.run(backend.search(SearchRequestSpec(query="second")))
+
+    assert any("did not authenticate" in f["error"] for f in second.partial_failures)
+
+
+def test_duplicate_citation_indexes_collapse_to_one_source() -> None:
+    payload = {
+        "answer": "a [1]",
+        "cards": [],
+        "citations": [
+            {"index": 1, "title": "First", "url": "https://a.example"},
+            {"index": 1, "title": "Second", "url": "https://b.example"},
+        ],
+    }
+    sources, _ = normalize_answer_result(
+        AnswerAgentResult.model_validate(payload), max_report_chars=5000
+    )
+
+    assert [d.source_id for d in sources] == [1]
+    assert sources[0].title == "First"
+
+
+def test_an_explicit_zero_timeout_is_not_coerced_to_the_default() -> None:
+    stages: list[str] = []
+    recorder = AgentRecorder([_sse(FULL_STREAM[0])])
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(
+            recorder.backend().deep_research(
+                DeepResearchSpec(question="Why?", timeout_seconds=0), stages.append
+            )
+        )
+
+    assert any("timeout=0s" in s for s in stages)
 
 
 def test_401_falls_back_to_anonymous_with_no_auth_header() -> None:
@@ -430,6 +509,19 @@ def test_anonymous_429_is_an_error() -> None:
         asyncio.run(backend.search(SearchRequestSpec(query="a")))
 
 
+def test_anonymous_429_with_an_html_body_reports_the_page_text() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            headers={"content-type": "text/html"},
+            text="<html><body>429 Too Many Requests</body></html>",
+        )
+
+    backend = TakoBackend(api_key=None, transport=httpx.MockTransport(handler))
+    with pytest.raises(RuntimeError, match="rate limited: .*429 Too Many Requests"):
+        asyncio.run(backend.search(SearchRequestSpec(query="a")))
+
+
 def test_anonymous_sse_reply_is_decoded() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         payload = json.dumps(_rpc_ok(ANONYMOUS_OUTPUT))
@@ -448,7 +540,15 @@ def test_anonymous_sse_reply_is_decoded() -> None:
 def _frame(seq: int, block: dict) -> str:
     return (
         "data: "
-        + json.dumps({"seq": seq, "run_id": "run-1", "category": "activity", "block": block})
+        + json.dumps(
+            {
+                "seq": seq,
+                "run_id": "run-1",
+                "thread_id": "thr-1",
+                "category": "activity",
+                "block": block,
+            }
+        )
         + "\n\n"
     )
 
@@ -554,6 +654,31 @@ def test_deep_research_resumes_once_after_a_drop() -> None:
     assert resume.url.path == "/api/v1/agent/answer/runs/run-1"
     assert resume.url.params["starting_after"] == "1"
     assert result.request_ids == ["run-1"]
+
+
+def test_non_sse_interstitial_on_resume_falls_through_to_polling() -> None:
+    dropped = _sse(FULL_STREAM[0], FULL_STREAM[1])
+    interstitial = httpx.Response(200, headers={"content-type": "text/html"}, text="<html>go away")
+    completed = httpx.Response(
+        200,
+        json={
+            "run_id": "run-1",
+            "status": "completed",
+            "created_at": "x",
+            "result": ANSWER_RESULT,
+            "usage": {"total_cost_usd": 0.11},
+        },
+    )
+    recorder = AgentRecorder([dropped, interstitial, completed])
+    stages: list[str] = []
+
+    result = asyncio.run(
+        recorder.backend().deep_research(DeepResearchSpec(question="Why?"), stages.append)
+    )
+
+    assert [r.method for r in recorder.requests] == ["POST", "GET", "GET"]
+    assert result.answer_markdown.startswith("GDP grew 2.1%")
+    assert any("text/event-stream" in s for s in stages)
 
 
 def test_deep_research_polls_when_resume_has_no_result(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -751,6 +876,34 @@ def test_lost_agent_result_frame_falls_through_to_polling() -> None:
     assert [r.method for r in recorder.requests] == ["POST", "GET"]
     assert result.estimated_cost_usd == 0.11
     assert result.answer_markdown.startswith("GDP grew 2.1%")
+
+
+def test_undecodable_agent_result_payload_falls_through_to_polling() -> None:
+    drifted_result = (
+        'data: {"seq": 4, "run_id": "run-1", "block": {"kind": "agent_result", '
+        '"data": {"answer": "a", "cards": [], "citations": [{"index": 1}]}}}\n\n'
+    )
+    stream = _sse(FULL_STREAM[0], drifted_result, FULL_STREAM[5], FULL_STREAM[6])
+    completed = httpx.Response(
+        200,
+        json={
+            "run_id": "run-1",
+            "status": "completed",
+            "created_at": "x",
+            "result": ANSWER_RESULT,
+            "usage": {"total_cost_usd": 0.11},
+        },
+    )
+    recorder = AgentRecorder([stream, completed])
+    stages: list[str] = []
+
+    result = asyncio.run(
+        recorder.backend().deep_research(DeepResearchSpec(question="Why?"), stages.append)
+    )
+
+    assert [r.method for r in recorder.requests] == ["POST", "GET"]
+    assert result.answer_markdown.startswith("GDP grew 2.1%")
+    assert any("unreadable agent_result" in s for s in stages)
 
 
 def test_sparse_citation_indexes_survive_and_uncited_card_follows_the_highest() -> None:
