@@ -1,9 +1,13 @@
 """Tako backend.
 
-`search` calls `POST /api/v3/search` with the `TAKO_API_KEY` placeholder and,
-when that returns 401, the anonymous `tako_search` tool on `mcp.tako.com`.
-`deep_research` runs the Tako Answer Agent over SSE (keyed only). Transport is
-`httpx`, which honors `HTTPS_PROXY` so iron-proxy can rewrite the header.
+`search` calls `POST /api/v3/search` through the Tako SDK with the `TAKO_API_KEY`
+placeholder and, when that returns 401 or 403, the anonymous `tako_search` tool
+on `mcp.tako.com`. `deep_research` runs the Tako Answer Agent over the SDK's SSE
+stream (keyed only). Every transport is `httpx`, which honors `HTTPS_PROXY` so
+iron-proxy can rewrite the header.
+
+The SDK's `tako.aio` lane is the async client; its models are distinct classes
+from the sync `tako.models`, so nothing here imports the sync lane.
 """
 
 from __future__ import annotations
@@ -16,11 +20,37 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
-from httpx_sse import SSEError, aconnect_sse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field
+from tako.aio import Configuration
+from tako.aio.api.agent_api import AgentApi
+from tako.aio.api.tako_api import TakoApi
+from tako.aio.exceptions import ApiException
+from tako.aio.models import (
+    AgentRunStatus,
+    AnswerAgentEffort,
+    AnswerAgentResult,
+    AnswerAgentRun,
+    AnswerAgentRunRequest,
+    AnswerAgentStreamEnvelope,
+    DataSourceSettings,
+    RunSummaryEvent,
+    SearchEffortLevel,
+    SearchRequest,
+    SearchResponse,
+    Sources,
+    StatusEvent,
+    SubagentEvent,
+    TakoCard,
+    ToolCallEvent,
+    ToolRetryEvent,
+    Usage,
+    WebResult,
+    WebSourceSettings,
+)
+from tako.lib.agent import AsyncAnswerAgentResource
+from tako.lib.caller import stamped_async_api_client
 
 from ._common import (
-    TOOL_VERSION,
     USER_AGENT,
     append_within_budget,
     decode_jsonrpc_response,
@@ -35,12 +65,9 @@ from .models import (
 )
 
 API_BASE_URL = "https://tako.com"
-SEARCH_PATH = "/api/v3/search"
-AGENT_RUNS_PATH = "/api/v1/agent/answer/runs"
+API_PATH_PREFIX = "/api"
 MCP_URL = "https://mcp.tako.com/mcp"
-CALLER_HEADER = "X-Tako-Caller"
-CALLER_VALUE = f'channel=centaur, client_version="{TOOL_VERSION}"'
-SEARCH_PRICE_USD: dict[str, float] = {"instant": 0.007, "fast": 0.007, "deep": 0.012}
+
 DEFAULT_SEARCH_EFFORT = "fast"
 DEFAULT_RESEARCH_EFFORT = "medium"
 DEFAULT_DEEP_RESEARCH_TIMEOUT_SECONDS = 600.0
@@ -53,63 +80,8 @@ MAX_DOMAIN_FILTERS = 20
 FALLBACK_CITATION_URL = "https://tako.com"
 RATE_LIMIT_KINDS = {"rate_limited", "global_rate_limited"}
 NOT_GRANTED_STATUSES = {401, 403}
-TERMINAL_RUN_STATUSES = {"completed", "failed"}
-
-
-class CardSource(BaseModel):
-    source_name: str | None = None
-
-
-class CardMethodology(BaseModel):
-    methodology_name: str | None = None
-    methodology_description: str | None = None
-
-
-class MetricDefinition(BaseModel):
-    name: str
-    definition: str
-
-
-class DataFreshness(BaseModel):
-    last_updated: str | None = None
-
-
-class TakoCard(BaseModel):
-    """The fields of a v3 `TakoCard` this tool reads."""
-
-    title: str | None = None
-    description: str | None = None
-    semantic_description: str | None = None
-    webpage_url: str | None = None
-    sources: list[CardSource] | None = None
-    methodologies: list[CardMethodology] | None = None
-    metric_definitions: list[MetricDefinition] | None = None
-    data_freshness: DataFreshness | None = None
-
-
-class TakoWebResult(BaseModel):
-    title: str | None = None
-    url: str
-    snippet: str | None = None
-    source_name: str | None = None
-    publish_date: str | None = None
-
-
-class Usage(BaseModel):
-    """Tako's metered usage. Extra fields (`compute`, `data`) pass through `model_dump()`."""
-
-    model_config = ConfigDict(extra="allow")
-
-    total_cost_usd: float | None = None
-
-
-class SearchApiResponse(BaseModel):
-    """`POST /api/v3/search` response, the fields this tool reads."""
-
-    cards: list[TakoCard] = Field(default_factory=list)
-    web_results: list[TakoWebResult] = Field(default_factory=list)
-    request_id: str | None = None
-    usage: Usage | None = None
+TERMINAL_RUN_STATUSES = {AgentRunStatus.COMPLETED, AgentRunStatus.FAILED}
+SEARCH_PRICE_USD: dict[str, float] = {"instant": 0.007, "fast": 0.007, "deep": 0.012}
 
 
 class ProjectedCard(BaseModel):
@@ -140,58 +112,6 @@ class AnonymousSearchOutput(BaseModel):
     source_notes: dict[str, str] = Field(default_factory=dict)
 
 
-class Citation(BaseModel):
-    index: int
-    title: str
-    url: str | None = None
-    source_name: str | None = None
-    excerpt: str | None = None
-    publish_date: str | None = None
-
-
-class Definition(BaseModel):
-    term: str
-    definition: str
-    source_ref: int | None = None
-
-
-class TitledNote(BaseModel):
-    title: str
-    description: str
-
-
-class AnswerMetadata(BaseModel):
-    definitions: list[Definition] | None = None
-    assumptions: list[TitledNote] | None = None
-    methodology: list[TitledNote] | None = None
-
-
-class AnswerAgentResult(BaseModel):
-    """The `agent_result` payload of an Answer Agent run."""
-
-    answer: str | None = None
-    cards: list[TakoCard] = Field(default_factory=list)
-    citations: list[Citation] = Field(default_factory=list)
-    metadata: AnswerMetadata | None = None
-    refusal_code: str | None = None
-    request_id: str | None = None
-
-
-class RunError(BaseModel):
-    code: str
-    message: str
-
-
-class AnswerAgentRun(BaseModel):
-    """The run resource from `GET /api/v1/agent/answer/runs/{run_id}`."""
-
-    run_id: str
-    status: str
-    result: AnswerAgentResult | None = None
-    error: RunError | None = None
-    usage: Usage | None = None
-
-
 class McpToolResult(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -219,60 +139,8 @@ class JsonRpcResponse(BaseModel):
     error: JsonRpcError | None = None
 
 
-class StreamBlock(BaseModel):
-    """One SSE block. Fields are the union of the kinds this tool reads; unknown kinds are ignored.
-
-    `error` carries two shapes because two kinds send it: `run_summary` sends a
-    `{code, message}` object, and `tool_retry` sends the tool's raw message as
-    free text. A single-shape field rejects the whole frame.
-    """
-
-    kind: str
-    message: str | None = None
-    tool: str | None = None
-    status_message: str | None = None
-    done: bool = False
-    subagent_type: str | None = None
-    event: str | None = None
-    data: dict[str, Any] | None = None
-    status: str | None = None
-    usage: Usage | None = None
-    error: RunError | str | None = None
-
-
-class StreamEnvelope(BaseModel):
-    seq: int
-    run_id: str
-    block: StreamBlock
-
-
-class _StreamState(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    run_id: str | None = None
-    last_seq: int = -1
-    status: str | None = None
-    result: AnswerAgentResult | None = None
-    usage: Usage | None = None
-    error: RunError | None = None
-    done: bool = False
-    transport_error: Exception | None = None
-
-
 class NotGranted(Exception):
     """The placeholder was not rewritten: this principal has no TAKO_API_KEY grant."""
-
-
-def _skip_unreadable(progress: Callable[[str], None], what: str, exc: ValidationError) -> None:
-    """Report a frame the tool cannot parse. The poll fallback still returns the run."""
-    count = exc.error_count()
-    progress(f"skipped an unreadable {what} ({count} field{'' if count == 1 else 's'})")
-
-
-def _as_run_error(value: RunError | str | None) -> RunError | None:
-    if value is None or isinstance(value, RunError):
-        return value
-    return RunError(code="unknown", message=value)
 
 
 def _host(url: str) -> str | None:
@@ -311,7 +179,7 @@ def card_to_source(card: TakoCard, source_id: int) -> SourceDocument | None:
     )
 
 
-def _web_to_source(item: TakoWebResult, source_id: int) -> SourceDocument:
+def _web_to_source(item: WebResult, source_id: int) -> SourceDocument:
     return SourceDocument(
         source_id=source_id,
         title=item.title or item.url,
@@ -322,17 +190,17 @@ def _web_to_source(item: TakoWebResult, source_id: int) -> SourceDocument:
     )
 
 
-def normalize_search_response(payload: SearchApiResponse) -> list[SourceDocument]:
+def normalize_search_response(payload: SearchResponse) -> list[SourceDocument]:
     """Cards first, then web results, deduplicated by URL and numbered by position."""
     sources: list[SourceDocument] = []
     seen: set[str] = set()
-    for card in payload.cards:
+    for card in payload.cards or []:
         document = card_to_source(card, len(sources))
         if document is None or document.url in seen:
             continue
         seen.add(document.url)
         sources.append(document)
-    for item in payload.web_results:
+    for item in payload.web_results or []:
         if item.url in seen:
             continue
         seen.add(item.url)
@@ -390,12 +258,13 @@ def normalize_answer_result(
 ) -> tuple[list[SourceDocument], str]:
     """Citations keep their `[n]` indexes; uncited cards follow; the report gains
     Charts, Definitions, Assumptions, Methodology, and Sources sections."""
+    cards = result.cards or []
     card_url_by_title = {
-        card.title: card.webpage_url for card in result.cards if card.title and card.webpage_url
+        card.title: card.webpage_url for card in cards if card.title and card.webpage_url
     }
     sources: list[SourceDocument] = []
     seen_indexes: set[int] = set()
-    for citation in result.citations:
+    for citation in result.citations or []:
         if citation.index in seen_indexes:
             continue
         seen_indexes.add(citation.index)
@@ -412,7 +281,7 @@ def normalize_answer_result(
         )
     cited_urls = {source.url for source in sources}
     next_id = max((source.source_id for source in sources), default=0) + 1
-    for card in result.cards:
+    for card in cards:
         if not card.webpage_url or card.webpage_url in cited_urls:
             continue
         document = card_to_source(card, next_id)
@@ -425,11 +294,7 @@ def normalize_answer_result(
     body = (result.answer or "").strip()
     body += _section(
         "Charts",
-        [
-            f"- {card.title or 'Chart'}: {card.webpage_url}"
-            for card in result.cards
-            if card.webpage_url
-        ],
+        [f"- {card.title or 'Chart'}: {card.webpage_url}" for card in cards if card.webpage_url],
     )
     metadata = result.metadata
     if metadata is not None:
@@ -452,6 +317,42 @@ def normalize_answer_result(
     return sources, body[:max_report_chars].rstrip()
 
 
+def _report_progress(block: object, progress: Callable[[str], None]) -> None:
+    if isinstance(block, StatusEvent):
+        progress(block.message)
+    elif isinstance(block, ToolCallEvent):
+        suffix = f": {block.status_message}" if block.status_message else ""
+        progress(f"{'finished' if block.done else 'calling'} {block.tool}{suffix}")
+    elif isinstance(block, ToolRetryEvent):
+        progress(f"retrying {block.tool}: {block.error}")
+    elif isinstance(block, SubagentEvent):
+        progress(f"{block.event} {block.subagent_type}")
+
+
+def _run_settled_by_stream(
+    run_id: str, summary: RunSummaryEvent | None, result: AnswerAgentResult | None
+) -> AnswerAgentRun | None:
+    if summary is None or summary.status not in TERMINAL_RUN_STATUSES:
+        return None
+    if result is None and summary.status != AgentRunStatus.FAILED:
+        return None
+    return AnswerAgentRun(
+        run_id=run_id,
+        status=summary.status,
+        created_at=summary.created_at,
+        completed_at=summary.completed_at,
+        result=result,
+        error=summary.error,
+        usage=summary.usage,
+    )
+
+
+def _agent_api_error(exc: ApiException) -> RuntimeError:
+    if exc.status in NOT_GRANTED_STATUSES:
+        return RuntimeError("deep_research requires a valid, granted TAKO_API_KEY.")
+    return RuntimeError(f"Tako answer agent request failed ({exc.status}): {str(exc.body)[:500]}")
+
+
 class TakoBackend:
     """Tako search (keyed REST or anonymous MCP) and the Tako Answer Agent."""
 
@@ -461,29 +362,18 @@ class TakoBackend:
         api_key: str | None,
         api_base_url: str = API_BASE_URL,
         mcp_url: str = MCP_URL,
-        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._api_key = api_key
-        self._api_base_url = api_base_url.rstrip("/")
+        self._config = Configuration(
+            host=api_base_url.rstrip("/") + API_PATH_PREFIX,
+            api_key={"apiKey": api_key} if api_key else None,
+        )
         self._mcp_url = mcp_url
-        self._transport = transport
         self._rest_auth_failed = False
 
     @property
     def search_mode(self) -> str:
         return "api" if self._api_key and not self._rest_auth_failed else "anonymous"
-
-    def _http(self, timeout: float | httpx.Timeout) -> httpx.AsyncClient:
-        return httpx.AsyncClient(timeout=timeout, transport=self._transport)
-
-    def _keyed_headers(self) -> dict[str, str]:
-        return {
-            "X-API-Key": self._api_key or "",
-            CALLER_HEADER: CALLER_VALUE,
-            "User-Agent": USER_AGENT,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
 
     def _anonymous_headers(self) -> dict[str, str]:
         return {
@@ -514,36 +404,33 @@ class TakoBackend:
             )
         return await self._search_anonymous(request, query, partial_failures)
 
-    def _search_body(self, request: SearchRequestSpec, query: str) -> dict[str, Any]:
+    def _search_request(self, request: SearchRequestSpec, query: str) -> SearchRequest:
         count = max(1, min(MAX_SOURCE_COUNT, request.num_results))
-        data_count = min(count, DATA_CARD_COUNT)
-        web: dict[str, Any] = {"count": count, "highlights": True}
+        web = WebSourceSettings(count=count, highlights=True)
         if request.include_domains:
-            web["include_domains"] = request.include_domains[:MAX_DOMAIN_FILTERS]
+            web.include_domains = request.include_domains[:MAX_DOMAIN_FILTERS]
         if request.exclude_domains:
-            web["exclude_domains"] = request.exclude_domains[:MAX_DOMAIN_FILTERS]
+            web.exclude_domains = request.exclude_domains[:MAX_DOMAIN_FILTERS]
         if request.max_age_hours is not None and request.max_age_hours > 0:
             cutoff = dt.datetime.now(dt.UTC) - dt.timedelta(hours=request.max_age_hours)
-            web["published_after"] = cutoff.date().isoformat()
-        body: dict[str, Any] = {
-            "query": query,
-            "sources": {"data": {"count": data_count}, "web": web},
-        }
-        if request.effort:
-            body["effort"] = request.effort
-        return body
+            web.published_after = cutoff.date()
+        return SearchRequest(
+            query=query,
+            effort=SearchEffortLevel(request.effort) if request.effort else None,
+            sources=Sources(data=DataSourceSettings(count=min(count, DATA_CARD_COUNT)), web=web),
+        )
 
     async def _search_api(self, request: SearchRequestSpec, query: str) -> RetrievalResult:
-        async with self._http(request.timeout_seconds) as client:
-            response = await client.post(
-                f"{self._api_base_url}{SEARCH_PATH}",
-                headers=self._keyed_headers(),
-                json=self._search_body(request, query),
-            )
-        if response.status_code in NOT_GRANTED_STATUSES:
-            raise NotGranted
-        response.raise_for_status()
-        payload = SearchApiResponse.model_validate(response.json())
+        async with stamped_async_api_client(self._config) as api_client:
+            try:
+                payload = await TakoApi(api_client).search(
+                    self._search_request(request, query),
+                    _request_timeout=request.timeout_seconds,
+                )
+            except ApiException as exc:
+                if exc.status in NOT_GRANTED_STATUSES:
+                    raise NotGranted from exc
+                raise
         partial_failures: list[dict[str, str]] = []
         if request.max_chars_total is not None:
             partial_failures.append(
@@ -572,8 +459,8 @@ class TakoBackend:
         return RetrievalResult(
             sources=normalize_search_response(payload),
             backend="tako:api",
-            request_ids=[payload.request_id] if payload.request_id else [],
-            usage=[payload.usage.model_dump()] if payload.usage else [],
+            request_ids=[payload.request_id],
+            usage=[payload.usage.to_dict()] if payload.usage else [],
             partial_failures=partial_failures,
             estimated_cost_usd=billed if billed is not None else SEARCH_PRICE_USD[effort],
         )
@@ -616,7 +503,7 @@ class TakoBackend:
                 "arguments": {"query": query, "sources": ["data", "web"]},
             },
         }
-        async with self._http(request.timeout_seconds) as client:
+        async with httpx.AsyncClient(timeout=request.timeout_seconds) as client:
             response = await client.post(
                 self._mcp_url, headers=self._anonymous_headers(), json=envelope
             )
@@ -641,7 +528,7 @@ class TakoBackend:
         return RetrievalResult(
             sources=normalize_anonymous_output(payload),
             backend="tako:anonymous",
-            usage=[payload.usage.model_dump()] if payload.usage else [],
+            usage=[payload.usage.to_dict()] if payload.usage else [],
             partial_failures=partial_failures,
             estimated_cost_usd=0.0,
         )
@@ -685,7 +572,7 @@ class TakoBackend:
             ) from exc
         if run.result is None:
             detail = f": {run.error.message}" if run.error else ""
-            raise RuntimeError(f"Tako answer agent run {run.run_id} {run.status}{detail}")
+            raise RuntimeError(f"Tako answer agent run {run.run_id} {run.status.value}{detail}")
         if run.result.refusal_code:
             raise RuntimeError(
                 f"Tako declined the question before running (refusal_code={run.result.refusal_code})."
@@ -702,132 +589,48 @@ class TakoBackend:
             backend="tako:agent",
             request_ids=[run.run_id],
             partial_failures=partial_failures,
-            usage=[run.usage.model_dump()] if run.usage else [],
+            usage=[run.usage.to_dict()] if run.usage else [],
             estimated_cost_usd=billed,
         )
 
     async def _run_answer_agent(
         self, question: str, effort: str, progress: Callable[[str], None]
     ) -> AnswerAgentRun:
-        runs_url = f"{self._api_base_url}{AGENT_RUNS_PATH}"
-        timeout = httpx.Timeout(
-            connect=30.0, read=STREAM_READ_TIMEOUT_SECONDS, write=30.0, pool=30.0
-        )
-        state = _StreamState()
-        async with self._http(timeout) as client:
-            await self._consume_stream(
-                client,
-                "POST",
-                runs_url,
-                state,
-                progress,
-                json={"query": question, "effort": effort},
-            )
-            if not state.done and state.run_id:
-                progress("stream dropped; resuming")
-                params = {"starting_after": str(state.last_seq)} if state.last_seq >= 0 else None
-                await self._consume_stream(
-                    client, "GET", f"{runs_url}/{state.run_id}", state, progress, params=params
-                )
-            if state.result is not None and state.run_id:
-                return AnswerAgentRun(
-                    run_id=state.run_id,
-                    status=state.status or "completed",
-                    result=state.result,
-                    error=state.error,
-                    usage=state.usage,
-                )
-            if state.status == "failed" and state.run_id:
-                return AnswerAgentRun(run_id=state.run_id, status="failed", error=state.error)
-            if not state.run_id:
-                raise RuntimeError(
-                    "Tako answer agent stream ended before a run_id arrived."
-                ) from state.transport_error
-            return await self._poll_run(client, state.run_id, progress)
-
-    async def _consume_stream(
-        self,
-        client: httpx.AsyncClient,
-        method: str,
-        url: str,
-        state: _StreamState,
-        progress: Callable[[str], None],
-        *,
-        json: dict[str, Any] | None = None,
-        params: dict[str, str] | None = None,
-    ) -> None:
-        headers = {**self._keyed_headers(), "Accept": "text/event-stream"}
+        request = AnswerAgentRunRequest(query=question, effort=AnswerAgentEffort(effort))
         try:
-            async with aconnect_sse(
-                client, method, url, headers=headers, json=json, params=params
-            ) as source:
-                status_code = source.response.status_code
-                if status_code == 401:
-                    raise RuntimeError("deep_research requires a valid, granted TAKO_API_KEY.")
-                if status_code >= 400:
-                    body = (await source.response.aread()).decode(errors="replace")
-                    raise RuntimeError(
-                        f"Tako answer agent request failed ({status_code}): {body[:500]}"
-                    )
-                async for sse in source.aiter_sse():
-                    if not sse.data.strip():
-                        continue
-                    try:
-                        envelope = StreamEnvelope.model_validate_json(sse.data)
-                    except ValidationError as exc:
-                        _skip_unreadable(progress, "stream frame", exc)
-                        continue
-                    state.run_id = envelope.run_id
-                    state.last_seq = envelope.seq
-                    self._apply_block(envelope.block, state, progress)
-                    if state.done:
-                        return
-        except (
-            httpx.NetworkError,
-            httpx.TimeoutException,
-            httpx.RemoteProtocolError,
-            SSEError,
-        ) as exc:
-            progress(f"stream interrupted: {exc}")
-            state.transport_error = exc
-
-    @staticmethod
-    def _apply_block(
-        block: StreamBlock, state: _StreamState, progress: Callable[[str], None]
-    ) -> None:
-        if block.kind == "status" and block.message:
-            progress(block.message)
-        elif block.kind == "tool_call" and block.tool:
-            suffix = f": {block.status_message}" if block.status_message else ""
-            progress(f"{'finished' if block.done else 'calling'} {block.tool}{suffix}")
-        elif block.kind == "tool_retry" and block.tool:
-            detail = f": {block.error}" if isinstance(block.error, str) else ""
-            progress(f"retrying {block.tool}{detail}")
-        elif block.kind == "subagent" and block.subagent_type:
-            progress(f"{block.event or 'subagent'} {block.subagent_type}")
-        elif block.kind == "agent_result" and block.data is not None:
+            stream = await AsyncAnswerAgentResource(self._config).stream(
+                request, read_timeout=STREAM_READ_TIMEOUT_SECONDS
+            )
+        except ApiException as exc:
+            raise _agent_api_error(exc) from exc
+        summary: RunSummaryEvent | None = None
+        async with stream:
             try:
-                state.result = AnswerAgentResult.model_validate(block.data)
-            except ValidationError as exc:
-                _skip_unreadable(progress, "agent_result", exc)
-        elif block.kind == "run_summary":
-            state.status = block.status
-            state.usage = block.usage
-            state.error = _as_run_error(block.error)
-        elif block.kind == "stream_done":
-            state.done = True
+                envelope: AnswerAgentStreamEnvelope
+                async for envelope in stream:
+                    block = envelope.block.actual_instance
+                    if isinstance(block, RunSummaryEvent):
+                        summary = block
+                    _report_progress(block, progress)
+            except (httpx.TransportError, ApiException) as exc:
+                progress(f"stream interrupted: {exc}")
+        run_id = stream.run_id
+        if run_id is None:
+            raise RuntimeError("Tako answer agent stream ended before a run_id arrived.")
+        run = _run_settled_by_stream(run_id, summary, stream.result)
+        if run is not None:
+            return run
+        return await self._poll_run(run_id, progress)
 
-    async def _poll_run(
-        self, client: httpx.AsyncClient, run_id: str, progress: Callable[[str], None]
-    ) -> AnswerAgentRun:
-        url = f"{self._api_base_url}{AGENT_RUNS_PATH}/{run_id}"
-        while True:
-            response = await client.get(url, headers=self._keyed_headers())
-            if response.status_code == 401:
-                raise RuntimeError("deep_research requires a valid, granted TAKO_API_KEY.")
-            response.raise_for_status()
-            run = AnswerAgentRun.model_validate(response.json())
-            if run.status in TERMINAL_RUN_STATUSES:
-                return run
-            progress(f"state={run.status}")
-            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+    async def _poll_run(self, run_id: str, progress: Callable[[str], None]) -> AnswerAgentRun:
+        async with stamped_async_api_client(self._config) as api_client:
+            agent_api = AgentApi(api_client)
+            while True:
+                try:
+                    run = await agent_api.get_answer_agent_run(run_id)
+                except ApiException as exc:
+                    raise _agent_api_error(exc) from exc
+                if run.status in TERMINAL_RUN_STATUSES:
+                    return run
+                progress(f"state={run.status.value}")
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)

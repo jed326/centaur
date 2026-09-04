@@ -7,6 +7,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+import respx
 from centaur_tool_websearch import _parallel
 from centaur_tool_websearch import client as client_module
 from centaur_tool_websearch._parallel import ParallelBackend
@@ -282,7 +283,7 @@ def test_tako_secret_is_injected_on_tako_com_only() -> None:
         "search.parallel.ai",
         "api.anthropic.com",
     ]
-    assert any(dep.startswith("httpx-sse") for dep in manifest["project"]["dependencies"])
+    assert any(dep.startswith("tako-sdk") for dep in manifest["project"]["dependencies"])
 
 
 @pytest.mark.parametrize(
@@ -295,7 +296,11 @@ def test_tako_secret_is_injected_on_tako_com_only() -> None:
     ],
 )
 def test_routing_matrix_never_crosses_vendors(
-    monkeypatch: pytest.MonkeyPatch, backend_name: str, granted: bool, expected: str
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    backend_name: str,
+    granted: bool,
+    expected: str,
 ) -> None:
     monkeypatch.setenv(client_module.WEBSEARCH_BACKEND_ENV, backend_name)
     configure(StubBackend())
@@ -303,15 +308,15 @@ def test_routing_matrix_never_crosses_vendors(
     hosts: list[str] = []
 
     if backend_name == "tako":
-
-        def handler(request):
-            hosts.append(request.url.host)
-            if request.url.host == "tako.com":
-                return httpx.Response(
-                    200 if granted else 401,
-                    json={"request_id": "r", "cards": [], "web_results": []},
-                )
-            return httpx.Response(
+        router = respx.mock(assert_all_called=False)
+        router.post("https://tako.com/api/v3/search").mock(
+            return_value=httpx.Response(
+                200 if granted else 401,
+                json={"request_id": "r", "cards": [], "web_results": []},
+            )
+        )
+        router.post("https://mcp.tako.com/mcp").mock(
+            return_value=httpx.Response(
                 200,
                 json={
                     "jsonrpc": "2.0",
@@ -319,8 +324,9 @@ def test_routing_matrix_never_crosses_vendors(
                     "result": {"structuredContent": {"cards": [], "web_results": []}},
                 },
             )
-
-        client._backend._transport = httpx.MockTransport(handler)
+        )
+        router.start()
+        request.addfinalizer(router.stop)
     else:
 
         class FakeAuthenticationError(Exception):
