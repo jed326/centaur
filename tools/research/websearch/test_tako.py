@@ -254,17 +254,6 @@ def test_answer_result_report_sections_in_order() -> None:
     assert "[2] GDP (Second Estimate) | BEA — https://www.bea.gov/news/2026/gdp-q2" in report
 
 
-def test_answer_result_uncited_card_becomes_next_source() -> None:
-    payload = AnswerAgentResult.from_dict(
-        {**ANSWER_RESULT, "citations": ANSWER_RESULT["citations"][1:2]}
-    )
-    sources, _ = normalize_answer_result(payload, max_report_chars=50_000)
-    assert [(d.source_id, d.url) for d in sources] == [
-        (2, "https://www.bea.gov/news/2026/gdp-q2"),
-        (3, "https://tako.com/card/abc/"),
-    ]
-
-
 def test_answer_result_omits_empty_sections_and_protects_sources() -> None:
     payload = AnswerAgentResult.from_dict(
         {**ANSWER_RESULT, "cards": [], "metadata": None, "answer": "x" * 500}

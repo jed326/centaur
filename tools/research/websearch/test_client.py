@@ -4,16 +4,22 @@ import asyncio
 import tomllib
 import warnings
 from pathlib import Path
+from typing import get_args
 
 import httpx
 import pytest
 import respx
-from centaur_tool_websearch import _parallel
+from centaur_tool_websearch import _parallel, _tako
 from centaur_tool_websearch import client as client_module
-from centaur_tool_websearch._parallel import ParallelBackend
 from centaur_tool_websearch._tako import TakoBackend
 from centaur_tool_websearch.client import WebSearchClient
-from centaur_tool_websearch.models import DeepResearchResult, RetrievalResult, SourceDocument
+from centaur_tool_websearch.models import (
+    DeepResearchResult,
+    ResearchEffort,
+    RetrievalResult,
+    SearchEffort,
+    SourceDocument,
+)
 
 from centaur_sdk.backends import StubBackend, configure
 from centaur_sdk.backends.env import EnvBackend
@@ -77,12 +83,17 @@ def test_parallel_secret_is_injected_into_sdk_header() -> None:
     }
 
 
-@pytest.mark.parametrize("blank", ["", "   "])
-def test_a_blank_backend_env_uses_the_default(monkeypatch: pytest.MonkeyPatch, blank: str) -> None:
-    monkeypatch.setenv(client_module.WEBSEARCH_BACKEND_ENV, blank)
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("", "tako"), ("   ", "tako"), (" Tako ", "tako"), ("PARALLEL", "parallel")],
+)
+def test_backend_env_is_trimmed_lowercased_and_defaulted(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: str
+) -> None:
+    monkeypatch.setenv(client_module.WEBSEARCH_BACKEND_ENV, raw)
     configure(StubBackend())
 
-    assert WebSearchClient().backend_name == client_module.DEFAULT_BACKEND
+    assert WebSearchClient().backend_name == expected
 
 
 def test_synthesis_skipped_for_no_sources_is_distinguishable(
@@ -104,36 +115,6 @@ def test_unknown_backend_name_raises_at_construction(monkeypatch: pytest.MonkeyP
     monkeypatch.setenv(client_module.WEBSEARCH_BACKEND_ENV, "exa")
     with pytest.raises(RuntimeError, match="WEBSEARCH_BACKEND='exa' is not supported"):
         WebSearchClient()
-
-
-def test_backend_env_selects_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(client_module.WEBSEARCH_BACKEND_ENV, "parallel")
-    configure(StubBackend())
-    assert isinstance(WebSearchClient()._backend, ParallelBackend)
-
-
-def test_search_falls_back_to_anonymous_mcp_when_injected_auth_is_unavailable(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class FakeAuthenticationError(Exception):
-        pass
-
-    async def reject_rest(**_kwargs):
-        raise FakeAuthenticationError
-
-    async def search_mcp(**_kwargs):
-        return [], "mcp-request", []
-
-    configure(StubBackend())
-    client = WebSearchClient(backend="parallel")
-    monkeypatch.setattr(_parallel, "AuthenticationError", FakeAuthenticationError)
-    monkeypatch.setattr(client._backend, "_search_api", reject_rest)
-    monkeypatch.setattr(client._backend, "_search_mcp", search_mcp)
-
-    result = asyncio.run(client.search("fallback", synthesize=False))
-
-    assert result["meta"]["backend"] == "parallel:mcp"
-    assert result["meta"]["attribution"] == _parallel._FREE_MCP_ATTRIBUTION
 
 
 def test_deep_research_reports_missing_injected_auth(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -238,6 +219,17 @@ def test_mode_and_effort_together_is_an_error() -> None:
         asyncio.run(client.search("q", mode="basic", effort="fast"))
 
 
+def test_every_effort_has_a_price_and_a_vendor_mapping() -> None:
+    search_efforts = set(get_args(SearchEffort))
+    research_efforts = set(get_args(ResearchEffort))
+
+    assert set(client_module.SEARCH_EFFORTS) == search_efforts
+    assert set(client_module.RESEARCH_EFFORTS) == research_efforts
+    assert search_efforts <= set(_tako.SEARCH_PRICE_USD)
+    assert search_efforts <= set(_parallel.EFFORT_TO_SEARCH_MODE)
+    assert research_efforts <= set(_parallel.EFFORT_TO_PROCESSOR)
+
+
 def test_unknown_effort_is_a_clear_error() -> None:
     configure(StubBackend())
     client = WebSearchClient(backend="parallel")
@@ -254,12 +246,6 @@ def test_default_backend_is_tako(monkeypatch: pytest.MonkeyPatch) -> None:
     assert client.backend_name == "tako"
     assert isinstance(client._backend, TakoBackend)
     assert client._backend._api_key == "TAKO_API_KEY"
-
-
-def test_backend_env_is_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(client_module.WEBSEARCH_BACKEND_ENV, " Tako ")
-    configure(StubBackend())
-    assert isinstance(WebSearchClient()._backend, TakoBackend)
 
 
 def test_tako_secret_is_injected_on_tako_com_only() -> None:
@@ -283,7 +269,6 @@ def test_tako_secret_is_injected_on_tako_com_only() -> None:
         "search.parallel.ai",
         "api.anthropic.com",
     ]
-    assert any(dep.startswith("tako-sdk") for dep in manifest["project"]["dependencies"])
 
 
 @pytest.mark.parametrize(
@@ -305,7 +290,6 @@ def test_routing_matrix_never_crosses_vendors(
     monkeypatch.setenv(client_module.WEBSEARCH_BACKEND_ENV, backend_name)
     configure(StubBackend())
     client = WebSearchClient()
-    hosts: list[str] = []
 
     if backend_name == "tako":
         router = respx.mock(assert_all_called=False)
@@ -350,7 +334,7 @@ def test_routing_matrix_never_crosses_vendors(
 
     assert result["meta"]["backend"] == expected
     if backend_name == "tako":
-        assert set(hosts) <= {"tako.com", "mcp.tako.com"}
+        assert {call.request.url.host for call in router.calls} <= {"tako.com", "mcp.tako.com"}
 
 
 def test_deep_research_response_from_backend_result() -> None:

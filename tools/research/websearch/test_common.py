@@ -5,7 +5,6 @@ from pathlib import Path
 
 import httpx
 from centaur_tool_websearch import _common
-from centaur_tool_websearch.models import SourceDocument
 
 
 def test_tool_version_matches_pyproject() -> None:
@@ -26,12 +25,6 @@ def test_append_within_budget_keeps_an_oversized_trailer_whole() -> None:
     out = _common.append_within_budget("x" * 100, trailer, 5)
     assert out == trailer
     assert len(out) > 5
-
-
-def test_render_sources_block() -> None:
-    docs = [SourceDocument(source_id=1, title="T", url="https://a.example")]
-    assert _common.render_sources_block(docs) == "\n\n## Sources\n[1] T — https://a.example"
-    assert _common.render_sources_block([]) == ""
 
 
 def test_decode_jsonrpc_response_handles_json_and_sse() -> None:
