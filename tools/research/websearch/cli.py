@@ -13,7 +13,9 @@ from .client import _client
 
 load_dotenv()
 
-app = typer.Typer(name="websearch", help="Web search and deep research via Parallel")
+app = typer.Typer(
+    name="websearch", help="Web search and deep research via Parallel (default) or Tako"
+)
 
 console = Console(stderr=True)
 
@@ -111,7 +113,7 @@ def search(
     # Hidden from --help; if passed, we warn and ignore (no backend equivalent).
     search_type: str = typer.Option(None, "--search-type", help="[deprecated] no-op", hidden=True),
 ):
-    """Search the web through the backend WEBSEARCH_BACKEND selects."""
+    """Search the web through the backend WEBSEARCH_BACKEND selects (parallel by default, or tako)."""
     client = _configured_client()
     if search_type:
         console.print(
@@ -173,13 +175,13 @@ def deep_research_command(
         None,
         "--processor",
         "-p",
-        help="[deprecated] processor override (pro/ultra family); use --effort",
+        help="[deprecated] Parallel-only processor override (pro/ultra family)",
         hidden=True,
     ),
     timeout_seconds: float = typer.Option(
         None,
         "--timeout-seconds",
-        help="Overall budget. Defaults to a processor-appropriate value.",
+        help="Overall budget. Defaults to a processor-appropriate value on Parallel and 600s on Tako.",
     ),
     max_report_chars: int = typer.Option(
         50000, "--max-report-chars", help="Maximum report length in characters"
@@ -217,10 +219,12 @@ def deep_research_command(
     if deprecated_passed:
         console.print(
             f"[yellow]Ignored deprecated flags: {', '.join(deprecated_passed)} "
-            "(the backend runs a single multi-source job; iteration knobs no longer apply).[/]"
+            "(both backends run a single multi-source job; iteration knobs no longer apply).[/]"
         )
     if processor:
-        console.print(f"[yellow]--processor={processor!r} is deprecated; use --effort.[/]")
+        console.print(
+            f"[yellow]--processor={processor!r} is deprecated and Parallel-only; use --effort.[/]"
+        )
     try:
         payload = asyncio.run(
             client.deep_research(

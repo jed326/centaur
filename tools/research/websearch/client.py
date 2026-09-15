@@ -5,8 +5,8 @@ is configured, runs the Claude synthesis pipeline (reviewer → writer →
 citation repair) over them to produce a cited markdown report. `deep_research`
 asks the same backend for a finished report.
 
-The backend is chosen once from `WEBSEARCH_BACKEND` (`parallel`, the only value
-today and the default). Within a backend, a keyed path is tried first with the iron-proxy
+The backend is chosen once from `WEBSEARCH_BACKEND` (`parallel`, the default, or
+`tako`). Within a backend, a keyed path is tried first with the iron-proxy
 placeholder and the anonymous path is used when that returns 401.
 """
 
@@ -25,6 +25,9 @@ from anthropic import AsyncAnthropic, AuthenticationError
 from centaur_sdk import get_tool_context, secret
 
 from ._parallel import API_BASE_URL, MCP_URL, ParallelBackend
+from ._tako import API_BASE_URL as TAKO_API_BASE_URL
+from ._tako import MCP_URL as TAKO_MCP_URL
+from ._tako import TakoBackend
 from .models import (
     DeepResearchIteration,
     DeepResearchResponse,
@@ -46,7 +49,7 @@ WRITE_SOURCE_CHAR_LIMIT = 7000
 WRITE_TOTAL_CHAR_BUDGET = 220000
 
 WEBSEARCH_BACKEND_ENV = "WEBSEARCH_BACKEND"
-BACKEND_NAMES = ("parallel",)
+BACKEND_NAMES = ("parallel", "tako")
 DEFAULT_BACKEND = "parallel"
 SEARCH_EFFORTS = get_args(SearchEffort)
 RESEARCH_EFFORTS = get_args(ResearchEffort)
@@ -57,8 +60,8 @@ class ResearchBackend(Protocol):
     """One vendor's retrieval and research. Synthesis and assembly stay in the client.
 
     Each call reports which path it took as `RetrievalResult.backend`
-    (`parallel:api`, `parallel:mcp`); a backend keeps its own keyed-vs-anonymous
-    state private.
+    (`parallel:api`, `parallel:mcp`, `tako:api`, `tako:anonymous`); a backend
+    keeps its own keyed-vs-anonymous state private.
     """
 
     async def search(self, request: SearchRequestSpec) -> RetrievalResult: ...
@@ -144,6 +147,9 @@ class WebSearchClient:
         parallel_api_base_url: str | None = None,
         parallel_mcp_url: str | None = None,
         parallel_deep_research_processor: str | None = None,
+        tako_api_key: str | None = None,
+        tako_api_base_url: str | None = None,
+        tako_mcp_url: str | None = None,
         anthropic_api_key: str | None = None,
         synthesis_model: str | None = None,
         max_retries: int = 3,
@@ -152,6 +158,7 @@ class WebSearchClient:
         # Always pass the StubBackend placeholder so the SDK sends x-api-key.
         # Search falls back to anonymous MCP if injected authentication fails.
         self._parallel_api_key = parallel_api_key or _placeholder("PARALLEL_API_KEY")
+        self._tako_api_key = tako_api_key or _placeholder("TAKO_API_KEY")
         self._has_anthropic_key = anthropic_api_key is not None or _is_configured(
             "ANTHROPIC_API_KEY"
         )
@@ -163,6 +170,8 @@ class WebSearchClient:
         # StubBackend that would return the literal key name as a value.
         self._api_base_url = parallel_api_base_url or API_BASE_URL
         self._mcp_url = parallel_mcp_url or MCP_URL
+        self._tako_api_base_url = tako_api_base_url
+        self._tako_mcp_url = tako_mcp_url
         self._deep_research_processor = parallel_deep_research_processor or "ultra-fast"
         self._synthesis_model = synthesis_model or "claude-opus-4-6"
         self._max_retries = max_retries
@@ -170,12 +179,18 @@ class WebSearchClient:
         self._backend: ResearchBackend = self._build_backend()
 
     def _build_backend(self) -> ResearchBackend:
-        return ParallelBackend(
-            api_key=self._parallel_api_key,
-            api_base_url=self._api_base_url,
-            mcp_url=self._mcp_url,
-            deep_research_processor=self._deep_research_processor,
-            max_retries=self._max_retries,
+        if self._backend_name == "parallel":
+            return ParallelBackend(
+                api_key=self._parallel_api_key,
+                api_base_url=self._api_base_url,
+                mcp_url=self._mcp_url,
+                deep_research_processor=self._deep_research_processor,
+                max_retries=self._max_retries,
+            )
+        return TakoBackend(
+            api_key=self._tako_api_key,
+            api_base_url=self._tako_api_base_url or TAKO_API_BASE_URL,
+            mcp_url=self._tako_mcp_url or TAKO_MCP_URL,
         )
 
     def _set_progress_callback(self, callback: Callable[[str], None] | None) -> None:
@@ -228,13 +243,13 @@ class WebSearchClient:
             results. Requires `ANTHROPIC_API_KEY`; without one the call returns
             raw results and records the skipped synthesis in
             `meta.partial_failures`.
-          effort: `instant`, `fast` (default), or `deep`. Parallel maps `instant`
-            to `basic` and the others to `advanced`, noting `deep` in
-            `meta.partial_failures`. Anonymous paths record it there too.
+          effort: `instant`, `fast` (default), or `deep`. Tako honors all three;
+            Parallel maps `instant` to `basic` and the others to `advanced`.
+            Anonymous paths record it in `meta.partial_failures`.
           mode: Deprecated alias for `effort` (`basic` -> `instant`,
             `advanced` -> `fast`). Passing both is an error.
-          client_model, max_chars_total, session_id: Parallel REST knobs. The
-            anonymous path notes them in `meta.partial_failures`.
+          client_model, max_chars_total, session_id: Parallel REST knobs. Other
+            paths ignore them or note them in `meta.partial_failures`.
           include_domains / exclude_domains / max_age_hours: Source filters on
             the keyed paths; anonymous paths note them in `meta.partial_failures`.
             `max_age_hours` rounds down to a UTC calendar date.
@@ -347,17 +362,17 @@ class WebSearchClient:
         """Run deep research through the configured backend and return a cited report.
 
         Args:
-          effort: `medium` (default) or `high`. Parallel maps `medium` to
-            `ultra-fast` and `high` to `ultra`.
-          processor: Deprecated. Overrides the `effort` mapping with a Parallel
-            processor name.
-          timeout_seconds: Overall budget. Defaults to a processor-appropriate
-            value.
+          effort: `medium` (default) or `high`. Tako passes it to the Answer
+            Agent; Parallel maps `medium` to `ultra-fast` and `high` to `ultra`.
+          processor: Deprecated, Parallel-only. Overrides the `effort` mapping
+            on Parallel; Tako records it in `meta.partial_failures`.
+          timeout_seconds: Overall budget. Defaults to 600 s on Tako and to a
+            processor-appropriate value on Parallel.
           max_iterations / num_queries_per_iteration / num_results_per_query /
           thread_context: Accepted for backward compatibility; ignored.
 
-        Requires the backend's API key. There is no anonymous tier for deep
-        research.
+        Requires the backend's API key. Neither backend has an anonymous tier
+        for deep research.
         """
         deprecated = [
             ("max_iterations", max_iterations),
@@ -368,14 +383,14 @@ class WebSearchClient:
         used = [name for name, value in deprecated if value is not None]
         if used:
             warnings.warn(
-                f"deep_research kwargs ignored: {used}. The backend runs a single "
+                f"deep_research kwargs ignored: {used}. Both backends run a single "
                 "multi-source job; iteration knobs no longer apply.",
                 DeprecationWarning,
                 stacklevel=2,
             )
         if processor is not None:
             warnings.warn(
-                "processor is deprecated; use effort ('medium' or 'high').",
+                "processor is deprecated and Parallel-only; use effort ('medium' or 'high').",
                 DeprecationWarning,
                 stacklevel=2,
             )

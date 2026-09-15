@@ -1,6 +1,6 @@
 [project]
 name = "websearch"
-description = "Web search and deep research via Parallel, anonymous or keyed; optional Claude synthesis"
+description = "Web search and deep research via Parallel (default) or Tako, anonymous or keyed; optional Claude synthesis"
 version = "0.3.0"
 requires-python = ">=3.11"
 dependencies = [
@@ -10,12 +10,14 @@ dependencies = [
     "pydantic>=2.10.0",
     "python-dotenv>=1.0.0",
     "rich>=13.0.0",
+    "tako-sdk>=2.3.0",
     "typer>=0.12.0",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
+    "respx>=0.22.0",
 ]
 
 [project.scripts]
@@ -37,14 +39,15 @@ module = "client.py"
 # WEBSEARCH_BACKEND (sandbox env, default `parallel`) picks the vendor. Within a
 # vendor, `search` tries the keyed REST path with the injected placeholder and
 # falls back to that vendor's anonymous path on 401 or 403. `deep-research`
-# needs the vendor's key: PARALLEL_API_KEY for the Parallel Task API.
-# ANTHROPIC_API_KEY enables the Claude synthesis pipeline on top of `search`
-# results (reviewer → writer → citation repair).
+# needs the vendor's key: TAKO_API_KEY for the Tako Answer Agent, PARALLEL_API_KEY for
+# the Parallel Task API. ANTHROPIC_API_KEY enables the Claude synthesis
+# pipeline on top of `search` results (reviewer → writer → citation repair).
 # Give every secret below its own `hosts`. An entry that omits them inherits the
-# top-level `hosts` list, which would bind it to search.parallel.ai — the path
-# that must stay anonymous.
+# top-level `hosts` list, which would bind it to search.parallel.ai and
+# mcp.tako.com — the paths that must stay anonymous.
 optional_secrets = [
     {type = "http", name = "PARALLEL_API_KEY", mode = "inject", inject_header = "x-api-key", hosts = ["api.parallel.ai"]},
+    {type = "http", name = "TAKO_API_KEY", mode = "inject", inject_header = "X-API-Key", hosts = ["tako.com"]},
     {type = "http", name = "ANTHROPIC_API_KEY", mode = "inject", inject_header = "x-api-key", hosts = ["api.anthropic.com"]},
 ]
-hosts = ["api.parallel.ai", "search.parallel.ai", "api.anthropic.com"]
+hosts = ["api.parallel.ai", "search.parallel.ai", "tako.com", "mcp.tako.com", "api.anthropic.com"]

@@ -6,8 +6,10 @@ import warnings
 from pathlib import Path
 from typing import get_args
 
+import httpx
 import pytest
-from centaur_tool_websearch import _parallel
+import respx
+from centaur_tool_websearch import _parallel, _tako
 from centaur_tool_websearch import client as client_module
 from centaur_tool_websearch._parallel import ParallelBackend
 from centaur_tool_websearch.client import WebSearchClient
@@ -25,7 +27,7 @@ from centaur_sdk.backends.env import EnvBackend
 
 @pytest.fixture(autouse=True)
 def _unset_tool_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
-    for key in ("PARALLEL_API_KEY", "ANTHROPIC_API_KEY"):
+    for key in ("TAKO_API_KEY", "PARALLEL_API_KEY", "ANTHROPIC_API_KEY"):
         monkeypatch.delenv(key, raising=False)
 
 
@@ -52,17 +54,18 @@ def test_client_uses_stub_to_enable_proxy_injection() -> None:
     client = WebSearchClient(backend="parallel")
 
     assert client._parallel_api_key == "PARALLEL_API_KEY"
+    assert client._tako_api_key == "TAKO_API_KEY"
 
 
 def test_an_exported_but_empty_key_still_takes_the_keyed_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     configure(EnvBackend())
-    monkeypatch.setenv("PARALLEL_API_KEY", "")
+    monkeypatch.setenv("TAKO_API_KEY", "")
 
-    client = WebSearchClient(backend="parallel")
+    client = WebSearchClient(backend="tako")
 
-    assert client._parallel_api_key == "PARALLEL_API_KEY"
+    assert client._tako_api_key == "TAKO_API_KEY"
     assert client._backend.search_mode == "api"
 
 
@@ -82,7 +85,7 @@ def test_parallel_secret_is_injected_into_sdk_header() -> None:
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
-    [("", "parallel"), ("   ", "parallel"), (" Parallel ", "parallel")],
+    [("", "parallel"), ("   ", "parallel"), (" Parallel ", "parallel"), ("TAKO", "tako")],
 )
 def test_backend_env_is_trimmed_lowercased_and_defaulted(
     monkeypatch: pytest.MonkeyPatch, raw: str, expected: str
@@ -222,6 +225,7 @@ def test_every_effort_has_a_price_and_a_vendor_mapping() -> None:
 
     assert set(client_module.SEARCH_EFFORTS) == search_efforts
     assert set(client_module.RESEARCH_EFFORTS) == research_efforts
+    assert search_efforts <= set(_tako.SEARCH_PRICE_USD)
     assert search_efforts <= set(_parallel.EFFORT_TO_SEARCH_MODE)
     assert research_efforts <= set(_parallel.EFFORT_TO_PROCESSOR)
 
@@ -244,36 +248,93 @@ def test_default_backend_is_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
     assert client._backend._api_key == "PARALLEL_API_KEY"
 
 
+def test_tako_secret_is_injected_on_tako_com_only() -> None:
+    manifest = tomllib.loads(Path(__file__).with_name("pyproject.toml").read_text())
+    centaur = manifest["tool"]["centaur"]
+    tako = next(
+        secret for secret in centaur["optional_secrets"] if secret["name"] == "TAKO_API_KEY"
+    )
+
+    assert tako == {
+        "type": "http",
+        "name": "TAKO_API_KEY",
+        "mode": "inject",
+        "inject_header": "X-API-Key",
+        "hosts": ["tako.com"],
+    }
+    assert centaur["hosts"] == [
+        "api.parallel.ai",
+        "search.parallel.ai",
+        "tako.com",
+        "mcp.tako.com",
+        "api.anthropic.com",
+    ]
+
+
 @pytest.mark.parametrize(
-    ("granted", "expected"),
-    [(True, "parallel:api"), (False, "parallel:mcp")],
+    ("backend_name", "granted", "expected"),
+    [
+        ("tako", True, "tako:api"),
+        ("tako", False, "tako:anonymous"),
+        ("parallel", True, "parallel:api"),
+        ("parallel", False, "parallel:mcp"),
+    ],
 )
-def test_routing_matrix_falls_back_within_the_vendor(
-    monkeypatch: pytest.MonkeyPatch, granted: bool, expected: str
+def test_routing_matrix_never_crosses_vendors(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    backend_name: str,
+    granted: bool,
+    expected: str,
 ) -> None:
-    class FakeAuthenticationError(Exception):
-        pass
-
-    async def rest(**_kwargs):
-        if not granted:
-            raise FakeAuthenticationError
-        return [], "r", []
-
-    async def mcp(**_kwargs):
-        if granted:
-            raise AssertionError("MCP must not run when injected auth succeeds")
-        return [], "m", []
-
-    monkeypatch.setenv(client_module.WEBSEARCH_BACKEND_ENV, "parallel")
+    monkeypatch.setenv(client_module.WEBSEARCH_BACKEND_ENV, backend_name)
     configure(StubBackend())
     client = WebSearchClient()
-    monkeypatch.setattr(_parallel, "AuthenticationError", FakeAuthenticationError)
-    monkeypatch.setattr(client._backend, "_search_api", rest)
-    monkeypatch.setattr(client._backend, "_search_mcp", mcp)
+
+    if backend_name == "tako":
+        router = respx.mock(assert_all_called=False)
+        router.post("https://tako.com/api/v3/search").mock(
+            return_value=httpx.Response(
+                200 if granted else 401,
+                json={"request_id": "r", "cards": [], "web_results": []},
+            )
+        )
+        router.post("https://mcp.tako.com/mcp").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": "1",
+                    "result": {"structuredContent": {"cards": [], "web_results": []}},
+                },
+            )
+        )
+        router.start()
+        request.addfinalizer(router.stop)
+    else:
+
+        class FakeAuthenticationError(Exception):
+            pass
+
+        async def rest(**_kwargs):
+            if not granted:
+                raise FakeAuthenticationError
+            return [], "r", []
+
+        async def mcp(**_kwargs):
+            if granted:
+                raise AssertionError("MCP must not run when injected auth succeeds")
+            return [], "m", []
+
+        monkeypatch.setattr(_parallel, "AuthenticationError", FakeAuthenticationError)
+        monkeypatch.setattr(client._backend, "_search_api", rest)
+        monkeypatch.setattr(client._backend, "_search_mcp", mcp)
 
     result = asyncio.run(client.search("q", synthesize=False))
 
     assert result["meta"]["backend"] == expected
+    if backend_name == "tako":
+        assert {call.request.url.host for call in router.calls} <= {"tako.com", "mcp.tako.com"}
 
 
 def test_deep_research_response_from_backend_result() -> None:
