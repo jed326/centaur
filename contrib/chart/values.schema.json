@@ -2,7 +2,16 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "definitions": {
+    "podScheduling": {
+      "type": "object",
+      "properties": {
+        "nodeSelector": { "type": "object" },
+        "affinity": { "type": "object" },
+        "tolerations": { "type": "array" }
+      }
+    },
     "consoleConfig": {
+      "allOf": [{ "$ref": "#/definitions/podScheduling" }],
       "type": "object",
       "properties": {
         "replicaCount": { "type": "integer" },
@@ -75,6 +84,7 @@
           }
         },
         "worker": {
+          "allOf": [{ "$ref": "#/definitions/podScheduling" }],
           "type": "object",
           "properties": {
             "replicaCount": { "type": "integer" },
@@ -259,6 +269,7 @@
       }
     },
     "repoCache": {
+      "allOf": [{ "$ref": "#/definitions/podScheduling" }],
       "type": "object",
       "properties": {
         "enabled": { "type": "boolean" },
@@ -315,9 +326,6 @@
             "failureThreshold": { "type": "integer" }
           }
         },
-        "nodeSelector": { "type": "object" },
-        "tolerations": { "type": "array" },
-        "affinity": { "type": "object" },
         "resources": { "type": "object" }
       }
     },
@@ -349,11 +357,16 @@
       }
     },
     "apiRs": {
+      "allOf": [{ "$ref": "#/definitions/podScheduling" }],
       "type": "object",
       "properties": {
         "syncInfraSecrets": { "type": "boolean" },
         "mcpV2Enabled": { "type": "boolean" },
         "mcpPublicUrl": { "type": "string" },
+        "sessionPrincipalAdmission": {
+          "type": "string",
+          "enum": ["automatic", "preapproved"]
+        },
         "sandboxRunningLimit": { "type": "integer", "minimum": 0 },
         "sandboxHotIdleGraceSecs": { "type": "integer", "minimum": 0 },
         "sessionEventsRetentionDays": { "type": "integer", "minimum": 0, "maximum": 3650 },
@@ -497,6 +510,7 @@
       }
     },
     "postgres": {
+      "allOf": [{ "$ref": "#/definitions/podScheduling" }],
       "type": "object",
       "properties": {
         "persistence": {

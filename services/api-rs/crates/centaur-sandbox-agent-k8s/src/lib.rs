@@ -64,7 +64,10 @@ pub struct AgentSandboxConfig {
     pub field_manager: String,
     pub container_name: String,
     pub labels: BTreeMap<String, String>,
+    /// Metadata applied to the Sandbox custom resource and its pod template.
     pub annotations: BTreeMap<String, String>,
+    /// Operator metadata applied only to sandbox and iron-proxy pods.
+    pub pod_annotations: BTreeMap<String, String>,
     pub image_pull_policy: Option<String>,
     pub image_pull_secrets: Vec<String>,
     /// Node steering for every sandbox pod **and** its paired iron-proxy pod.
@@ -138,6 +141,7 @@ impl AgentSandboxConfig {
             container_name: DEFAULT_CONTAINER_NAME.to_owned(),
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
+            pod_annotations: BTreeMap::new(),
             image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             node_selector: BTreeMap::new(),
@@ -318,7 +322,8 @@ impl AgentSandboxBackend {
             .with_labels(sandbox.metadata.labels.clone().unwrap_or_default())
             .with_created_at(sandbox_creation_time(sandbox))
             .with_suspended_since(sandbox_paused_at(sandbox))
-            .with_reason(pod.as_ref().and_then(pod_termination_reason)))
+            .with_reason(pod.as_ref().and_then(pod_termination_reason))
+            .with_instance_id(pod.as_ref().and_then(|pod| pod.metadata.uid.clone())))
     }
 
     async fn patch_sandbox_merge(&self, id: &SandboxId, patch: Value) -> SandboxResult<()> {
@@ -421,12 +426,14 @@ impl AgentSandboxBackend {
     }
 
     async fn attach_io(&self, id: &SandboxId) -> SandboxResult<SandboxIo> {
-        if self.status(id).await? != SandboxStatus::Running {
+        let observed = self.observe(id).await?;
+        if observed.status != SandboxStatus::Running {
             return Err(SandboxError::NotReady(format!(
                 "agent sandbox {} is not running",
                 id.as_str()
             )));
         }
+        let instance_id = observed.instance_id;
         let params = AttachParams::default()
             .container(self.config.container_name.clone())
             .stdin(true)
@@ -450,8 +457,16 @@ impl AgentSandboxBackend {
         let stdin = stdin.ok_or_else(|| SandboxError::io("stdin was not attached"))?;
         let stdout = stdout.ok_or_else(|| SandboxError::io("stdout was not attached"))?;
         let stderr = stderr.ok_or_else(|| SandboxError::io("stderr was not attached"))?;
+        let attached_instance_id = self.observe(id).await?.instance_id;
+        if attached_instance_id != instance_id {
+            return Err(SandboxError::NotReady(format!(
+                "agent sandbox {} changed instances while attaching",
+                id.as_str()
+            )));
+        }
         // Keep kube's attach process alive as long as the returned streams are in use.
-        Ok(SandboxIo::with_guard(stdin, stdout, stderr, attached))
+        Ok(SandboxIo::with_guard(stdin, stdout, stderr, attached)
+            .with_instance_id(attached_instance_id))
     }
 }
 
@@ -1157,6 +1172,8 @@ fn build_agent_sandbox(
             .filter(|name| !name.is_empty()),
     );
 
+    let mut pod_annotations = config.annotations.clone();
+    pod_annotations.extend(config.pod_annotations.clone());
     let mut agent_spec = json!({
         "replicas": 1,
         "service": false,
@@ -1164,7 +1181,7 @@ fn build_agent_sandbox(
         "podTemplate": {
             "metadata": {
                 "labels": pod_labels,
-                "annotations": config.annotations,
+                "annotations": pod_annotations,
             },
             "spec": pod_spec,
         },
@@ -1635,8 +1652,33 @@ mod tests {
         }];
         config.runtime_class_name = Some("gvisor".to_owned());
         config.priority_class_name = Some("centaur-sandbox".to_owned());
+        config.pod_annotations = BTreeMap::from([
+            ("karpenter.sh/do-not-disrupt".to_owned(), "true".to_owned()),
+            (PAUSED_AT_ANNOTATION.to_owned(), "operator-value".to_owned()),
+        ]);
 
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        assert_eq!(
+            sandbox
+                .spec
+                .pod_template
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.annotations.as_ref())
+                .and_then(|annotations| annotations.get("karpenter.sh/do-not-disrupt"))
+                .map(String::as_str),
+            Some("true")
+        );
+        assert!(
+            sandbox
+                .metadata
+                .annotations
+                .as_ref()
+                .is_none_or(|annotations| {
+                    !annotations.contains_key("karpenter.sh/do-not-disrupt")
+                        && !annotations.contains_key(PAUSED_AT_ANNOTATION)
+                })
+        );
         let pod_spec = &sandbox.spec.pod_template.spec;
 
         assert_eq!(

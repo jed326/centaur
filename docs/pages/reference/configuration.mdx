@@ -16,6 +16,10 @@ Use these as the main extension points:
 | `api.extraEnv` | API feature flags, worker tuning, retention, observability, and deployment-specific overrides. |
 | `apiRs.extraEnv` | Rust API feature flags, telemetry exporter settings, and deployment-specific overrides. |
 | `apiRs.metrics.*` | Prometheus/VictoriaMetrics scrape metadata for the Rust API `/metrics` endpoint. |
+| `apiRs.nodeSelector`, `apiRs.affinity`, `apiRs.tolerations` | Controls scheduling for api-rs pods, including dedicated tainted node pools. |
+| `console.nodeSelector`, `console.affinity`, `console.tolerations` | Controls scheduling for Console web pods, including dedicated tainted node pools. |
+| `console.worker.nodeSelector`, `console.worker.affinity`, `console.worker.tolerations` | Controls scheduling for Console background worker pods independently from the web pods. |
+| `postgres.nodeSelector`, `postgres.affinity`, `postgres.tolerations` | Controls scheduling for the bundled PostgreSQL pod. Ensure selected nodes can mount its persistent storage. |
 | `console.sqlExporter.*` | SQL Exporter configuration and scrape metadata for Console database metrics. |
 | `slackbot.extraEnv` | Slackbot HTTP, Slack, feedback, and cross-org behavior. |
 | `sandbox.extraEnv` | Extra variables copied into every sandbox pod through `KUBERNETES_SANDBOX_EXTRA_ENV`. |

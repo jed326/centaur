@@ -20,6 +20,11 @@ pub use tool_discovery::{
     discover_persona_registry, discover_tool_proxy_fragment,
 };
 
+#[doc(hidden)]
+pub fn warm_slack_public_channel_cache() {
+    slack_proxy::warm_slack_public_channel_cache();
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -106,6 +111,7 @@ mod tests {
             &self,
             _thread_key: &str,
             _metadata: Option<&Value>,
+            _create_if_missing: bool,
         ) -> Result<centaur_iron_control::Principal, centaur_iron_control::IronControlError>
         {
             Ok(test_principal("prn_test"))
@@ -115,6 +121,7 @@ mod tests {
             &self,
             _thread_key: &str,
             _metadata: Option<&Value>,
+            _create_if_missing: bool,
         ) -> Result<Option<centaur_iron_control::Principal>, centaur_iron_control::IronControlError>
         {
             Ok(None)

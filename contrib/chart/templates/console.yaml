@@ -51,6 +51,7 @@ spec:
       imagePullSecrets:
 {{ toYaml . | nindent 8 }}
       {{- end }}
+{{- include "centaur.podScheduling" (dict "values" $console "indent" 6) }}
       initContainers:
         # Create the console logical databases on the bundled Postgres: the
         # primary plus the Solid Cache/Queue/Cable databases (see

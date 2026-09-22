@@ -341,14 +341,10 @@ impl TurnTelemetry {
             }
         }
         attributes.push(KeyValue::new("lmnr.span.input", span_input.to_string()));
-        let span = SpanBuilder::from_name(format!(
-            "{}.tool.{}",
-            harness_name(self.harness),
-            labels.name
-        ))
-        .with_kind(SpanKind::Internal)
-        .with_attributes(attributes)
-        .start_with_context(tracer, parent);
+        let span = SpanBuilder::from_name(tool_span_name(self.harness, &labels))
+            .with_kind(SpanKind::Internal)
+            .with_attributes(attributes)
+            .start_with_context(tracer, parent);
         self.tools.insert(id, ActiveTool { span });
     }
 
@@ -788,11 +784,29 @@ fn centaur_tool_labels(item: &Value, centaur_tool_names: &BTreeSet<String>) -> O
                 words.get(3).map_or("call", String::as_str),
                 centaur_tool_names,
             ),
-            Some("run") => centaur_catalog_tool_labels(words.get(2)?, "cli", centaur_tool_names),
+            Some("run") => centaur_catalog_tool_labels(
+                words.get(2)?,
+                words.get(3).map_or("cli", String::as_str),
+                centaur_tool_names,
+            ),
             _ => None,
         };
     }
-    centaur_catalog_tool_labels(words.first()?, "cli", centaur_tool_names)
+    centaur_catalog_tool_labels(
+        words.first()?,
+        words.get(1).map_or("cli", String::as_str),
+        centaur_tool_names,
+    )
+}
+
+fn tool_span_name(harness: HarnessKind, labels: &ToolLabels) -> String {
+    let tool_name =
+        if labels.kind == "centaur" && labels.name != "centaur-tools" && labels.method != "cli" {
+            format!("{} {}", labels.name, labels.method)
+        } else {
+            labels.name.clone()
+        };
+    format!("{}.tool.{tool_name}", harness_name(harness))
 }
 
 fn centaur_catalog_tool_labels(
@@ -1186,6 +1200,15 @@ fn anthropic_pricing(model: &str) -> Option<TokenPricing> {
 }
 
 fn openai_pricing(model: &str) -> Option<TokenPricing> {
+    if model.contains("gpt-6-astra") {
+        return Some(TokenPricing {
+            input_per_mtok: 10.0,
+            cache_creation_per_mtok: 12.5,
+            cache_read_per_mtok: 1.0,
+            output_per_mtok: 60.0,
+            source: "centaur_estimate:openai:gpt-6-astra:standard-short-context",
+        });
+    }
     if model.contains("gpt-5-6-sol") {
         return Some(TokenPricing {
             input_per_mtok: 5.0,
@@ -1445,16 +1468,16 @@ mod tests {
     }
 
     #[test]
-    fn centaur_cli_command_exports_the_catalog_tool_name() {
+    fn centaur_cli_command_exports_the_tool_subcommand() {
         let (exporter, provider, tracer) = test_telemetry();
-        let mut turn = test_turn_with_centaur_tools(tracer, ["websearch"]);
+        let mut turn = test_turn_with_centaur_tools(tracer, ["gsuite"]);
         for method in ["item/started", "item/completed"] {
             turn.observe_wire_value(&json!({
                 "method": method,
                 "params": {"item": {
                     "id": "tool-1",
                     "type": "commandExecution",
-                    "command": "/bin/bash -lc 'websearch search --query secret-value'",
+                    "command": "/bin/bash -lc 'gsuite docs read secret-value'",
                     "exitCode": 0
                 }}
             }));
@@ -1464,13 +1487,13 @@ mod tests {
         let spans = exporter.get_finished_spans().expect("spans");
         assert_eq!(spans.len(), 1);
         let tool = &spans[0];
-        assert_eq!(tool.name, "codex.tool.websearch");
+        assert_eq!(tool.name, "codex.tool.gsuite docs");
         assert_eq!(attribute(tool, "tool.kind").as_deref(), Some("centaur"));
-        assert_eq!(attribute(tool, "tool.name").as_deref(), Some("websearch"));
-        assert_eq!(attribute(tool, "tool.method").as_deref(), Some("cli"));
+        assert_eq!(attribute(tool, "tool.name").as_deref(), Some("gsuite"));
+        assert_eq!(attribute(tool, "tool.method").as_deref(), Some("docs"));
         assert_eq!(
             attribute(tool, "tool.executable").as_deref(),
-            Some("websearch")
+            Some("gsuite")
         );
         assert_eq!(attribute(tool, "tool.command"), None);
         assert_eq!(attribute(tool, "tool.cwd"), None);
@@ -1812,6 +1835,28 @@ mod tests {
             estimate_usage_cost(HarnessKind::Codex, "openai", "gpt-5.5", &usage).expect("cost");
         assert!((cost.input_cost - 3.875).abs() < 1e-9);
         assert!((cost.output_cost - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn astra_cost_uses_standard_short_context_pricing() {
+        let usage = NormalizedTokenUsage {
+            input_tokens: Some(1_000_000),
+            cache_creation_input_tokens: Some(100_000),
+            cache_read_input_tokens: Some(200_000),
+            output_tokens: Some(100_000),
+            ..Default::default()
+        };
+
+        let cost =
+            estimate_usage_cost(HarnessKind::Codex, "openai", "gpt-6-astra", &usage).expect("cost");
+
+        assert!((cost.input_cost - 8.45).abs() < 1e-9);
+        assert!((cost.output_cost - 6.0).abs() < 1e-9);
+        assert!((cost.total_cost() - 14.45).abs() < 1e-9);
+        assert_eq!(
+            cost.source,
+            "centaur_estimate:openai:gpt-6-astra:standard-short-context"
+        );
     }
 
     #[test]
